@@ -17,8 +17,11 @@ env/
 *.xls
 *.csv
 data/
-master data files/
 *.parquet
+
+# Exception: Include master data files
+!master data files/
+!master data files/*.xlsx
 
 # Plots (can be regenerated)
 plots/
