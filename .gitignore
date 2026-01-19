@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Data files (too large for GitHub)
+*.xlsx
+*.xls
+*.csv
+data/
+*.parquet
+
+# Plots (can be regenerated)
+plots/
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# System files
+.DS_Store
+Thumbs.db
+nul
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
+
+# Temporary files
+*.log
+*.tmp
+temp/
+tmp/
+
+# Keep important files with exceptions
+!README.md
