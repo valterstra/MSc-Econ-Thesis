@@ -17,6 +17,7 @@ env/
 *.xls
 *.csv
 data/
+master data files/
 *.parquet
 
 # Plots (can be regenerated)

@@ -1021,12 +1021,13 @@ if __name__ == "__main__":
     OPTIMIZE_ARMAX_LAGS = False
 
     # Updated paths matching your local project directory
+    # Master data files are stored in 'master data files/' folder
     PATHS = {
-        'price': 'Spot_Prices.xlsx',
-        'wind': 'Master_Wind_Forecast_Merged_2021_2024.xlsx',
-        'hydro': 'Master_Hydro_Reservoir.xlsx',
-        'exch': 'Master_Exchange_Merged_2021_2024.xlsx',
-        'cons': 'Master_Consumption_2021_2024.xlsx'
+        'price': 'master data files/Spot_Prices.xlsx',
+        'wind': 'master data files/Master_Wind_Forecast_Merged_2021_2024.xlsx',
+        'hydro': 'master data files/Master_Hydro_Reservoir.xlsx',
+        'exch': 'master data files/Master_Exchange_Merged_2021_2024.xlsx',
+        'cons': 'master data files/Master_Consumption_2021_2024.xlsx'
     }
 
     try:

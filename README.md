@@ -551,6 +551,22 @@ EconMScThesis/
 ├── full_regression.py              # Main analysis script
 ├── README.md                        # This file
 │
+├── master data files/               # Merged master data (not in git)
+│   ├── Spot_Prices.xlsx
+│   ├── Master_Wind_Forecast_Merged_2021_2024.xlsx
+│   ├── Master_Hydro_Reservoir.xlsx
+│   ├── Master_Exchange_Merged_2021_2024.xlsx
+│   └── Master_Consumption_2021_2024.xlsx
+│
+├── merger functions/                # Data merger scripts
+│   ├── consumption_forecast_merger.py
+│   ├── exchange_merger.py
+│   ├── final_exchange_merger.py
+│   ├── final_wind_merger.py
+│   ├── hydro_merger.py
+│   ├── price_merger.py
+│   └── production_forecast_merger.py
+│
 ├── data/                            # Raw data files (not in git)
 │   ├── spot_price/
 │   ├── hydro_reservoir_reserves/
@@ -564,14 +580,10 @@ EconMScThesis/
 │   ├── raw_scatter_matrix_SE1.png
 │   └── outlier_summary_fredriksson_SE1.csv
 │
-├── Master files (merged data):
-│   ├── Spot_Prices.xlsx
-│   ├── Master_Wind_Forecast_Merged_2021_2024.xlsx
-│   ├── Master_Hydro_Reservoir.xlsx
-│   ├── Master_Exchange_Merged_2021_2024.xlsx
-│   └── Master_Consumption_2021_2024.xlsx
+├── Sources/                         # Reference papers and documentation
+│   └── 2016_Fredriksson_SSE_Thesis_3214.pdf
 │
-└── Verified files:
+└── Verified files (intermediate data, not in git):
     ├── Verified_Complete_Consumption_2021_2024.xlsx
     ├── Verified_S1_Wind_Forecast_2021_2024.xlsx
     └── ...
