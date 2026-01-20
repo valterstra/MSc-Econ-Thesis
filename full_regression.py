@@ -15,6 +15,61 @@ from scipy.stats import gaussian_kde
 
 # --- 1. DATA LOADING FUNCTIONS ---
 
+def load_commodities(path):
+    """
+    Load commodity prices (Brent crude oil and TTF natural gas) from Bloomberg export file.
+
+    The Master_Commodities.xlsx file has Bloomberg-style headers:
+    - Rows 0-5: Header metadata (skip)
+    - Row 6+: Data with columns: Date, TTF_Gas, WTI_Oil, Brent_Oil, MT1, LUA1, CP1
+
+    Returns DataFrame with columns: Date, Oil_Price (Brent), Gas_Price (TTF)
+    Daily frequency - will be merged with hourly data by date.
+    """
+    print("\n--- LOADING COMMODITY PRICES (Brent Oil & TTF Gas) ---")
+
+    # Read with proper header skipping (Bloomberg format)
+    df = pd.read_excel(path, header=None, skiprows=5)
+
+    # Assign column names based on Bloomberg structure
+    # Column 0: Dates, Column 1: TTF Gas, Column 3: Brent Oil
+    df.columns = ['Date', 'TTF_Gas', 'WTI_Oil', 'Brent_Oil', 'MT1', 'LUA1', 'CP1']
+
+    # Convert date column and filter valid dates
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+    df = df.dropna(subset=['Date'])
+
+    # Convert price columns to numeric
+    df['Brent_Oil'] = pd.to_numeric(df['Brent_Oil'], errors='coerce')
+    df['TTF_Gas'] = pd.to_numeric(df['TTF_Gas'], errors='coerce')
+
+    # Select and rename columns we need
+    df_commodities = df[['Date', 'Brent_Oil', 'TTF_Gas']].copy()
+    df_commodities.columns = ['Date', 'Oil_Price', 'Gas_Price']
+
+    # Filter to 2021-2024 range (matching electricity data)
+    df_commodities = df_commodities[
+        (df_commodities['Date'] >= '2021-01-01') &
+        (df_commodities['Date'] <= '2024-12-31')
+    ]
+
+    print(f"  Loaded {len(df_commodities)} daily commodity observations")
+    print(f"  Date range: {df_commodities['Date'].min().date()} to {df_commodities['Date'].max().date()}")
+    print(f"  Oil Price (Brent): mean={df_commodities['Oil_Price'].mean():.2f}, "
+          f"min={df_commodities['Oil_Price'].min():.2f}, max={df_commodities['Oil_Price'].max():.2f}")
+    print(f"  Gas Price (TTF): mean={df_commodities['Gas_Price'].mean():.2f}, "
+          f"min={df_commodities['Gas_Price'].min():.2f}, max={df_commodities['Gas_Price'].max():.2f}")
+
+    # Report missing values (handled later in load_all_thesis_data with other variables)
+    oil_missing = df_commodities['Oil_Price'].isna().sum()
+    gas_missing = df_commodities['Gas_Price'].isna().sum()
+    if oil_missing > 0 or gas_missing > 0:
+        print(f"  Missing values - Oil: {oil_missing}, Gas: {gas_missing}")
+        print(f"  (Will be handled with other variables via interpolation or row dropping)")
+
+    return df_commodities
+
+
 def load_all_thesis_data(paths, zone_price='SE1', zone_wind='S1', zone_hydro='SE1', zone_exch='SE1', zone_cons='SE1', use_interpolation=False):
     """Loads and merges all master files based on standardized Timestamps."""
 
@@ -41,6 +96,22 @@ def load_all_thesis_data(paths, zone_price='SE1', zone_wind='S1', zone_hydro='SE
         'Net_Exchange': pd.to_numeric(merged[f'{zone_exch}_Total_Net_Exchange'], errors='coerce'),
         'Consumption': pd.to_numeric(merged[zone_cons], errors='coerce')
     })
+
+    # Load and merge commodity prices (daily -> hourly) if path provided
+    if 'commodities' in paths:
+        df_commodities = load_commodities(paths['commodities'])
+
+        # Create date column for merging (extract date from hourly Datetime)
+        final_df['Date'] = final_df['Datetime'].dt.date
+        df_commodities['Date'] = df_commodities['Date'].dt.date
+
+        # Merge commodities on date (each hour gets the daily commodity price)
+        final_df = pd.merge(final_df, df_commodities, on='Date', how='left')
+
+        # Drop the temporary Date column
+        final_df = final_df.drop(columns=['Date'])
+
+        print(f"  Merged commodity prices: Oil (USD/barrel), Gas (EUR/MWh)")
 
     # Handle missing values based on configuration
     if use_interpolation:
@@ -198,13 +269,14 @@ def handle_outliers_fredriksson(df, use_deseasonalized=False):
 
 def deseasonalize_price(df):
     """
-    Remove seasonal patterns from Price, Consumption, and Hydro_Reserves using dummy variable regression.
+    Remove seasonal patterns from Price, Consumption, Hydro_Reserves, Oil_Price, and Gas_Price using dummy variable regression.
     Based on Fredriksson (2016) methodology.
 
-    Creates dummies for: Year, Month, Day-of-Week, Hour
-    Returns df with deseasonalized columns added for Price, Consumption, and Hydro_Reserves.
+    Creates dummies for: Year, Month, Day-of-Week, Hour, Holidays
+    Returns df with deseasonalized columns added for Price, Consumption, Hydro_Reserves, Oil_Price, and Gas_Price (if available).
 
     Note: Wind is NOT deseasonalized (Fredriksson logs wind directly).
+    Note: Net_Exchange is NOT deseasonalized (Fredriksson does not deseasonalize it).
     """
     print("\n--- DESEASONALIZING VARIABLES (Fredriksson 2016 methodology) ---")
 
@@ -214,14 +286,36 @@ def deseasonalize_price(df):
     df['DayOfWeek'] = df.index.dayofweek  # 0=Monday, 6=Sunday
     df['Hour'] = df.index.hour
 
+    # Create holiday indicator for Swedish/Nordic holidays
+    # Following Fredriksson (2016), we include major Swedish holidays
+    try:
+        import holidays
+        swedish_holidays = holidays.Sweden(years=range(df.index.year.min(), df.index.year.max() + 1))
+        df['Holiday'] = df.index.to_series().apply(lambda x: 1 if x.date() in swedish_holidays else 0).values
+        print("Holiday dummies created using Swedish holiday calendar")
+    except ImportError:
+        # Fallback: simple holiday definition if holidays package not available
+        print("Warning: 'holidays' package not found. Using basic holiday definition.")
+        print("Install with: pip install holidays")
+        # Define basic holidays manually (New Year, Christmas, Midsummer, etc.)
+        df['Holiday'] = 0
+        for date in df.index:
+            # New Year's Day
+            if (date.month == 1 and date.day == 1) or \
+               (date.month == 12 and date.day in [24, 25, 26, 31]) or \
+               (date.month == 6 and date.day in [19, 20, 21, 22, 23, 24, 25, 26]) or \
+               (date.month == 5 and date.day == 1):  # Labor Day, Midsummer, Christmas
+                df.loc[date, 'Holiday'] = 1
+
     # Create dummy variables (drop_first=True avoids multicollinearity)
     year_dummies = pd.get_dummies(df['Year'], prefix='Year', drop_first=True, dtype=float)
     month_dummies = pd.get_dummies(df['Month'], prefix='Month', drop_first=True, dtype=float)
     dow_dummies = pd.get_dummies(df['DayOfWeek'], prefix='DOW', drop_first=True, dtype=float)
     hour_dummies = pd.get_dummies(df['Hour'], prefix='Hour', drop_first=True, dtype=float)
+    holiday_dummy = df[['Holiday']].astype(float)
 
     # Combine all seasonal dummies
-    seasonal_dummies = pd.concat([year_dummies, month_dummies, dow_dummies, hour_dummies], axis=1)
+    seasonal_dummies = pd.concat([year_dummies, month_dummies, dow_dummies, hour_dummies, holiday_dummy], axis=1)
     seasonal_dummies = sm.add_constant(seasonal_dummies).astype(float)
 
     # Deseasonalize Price
@@ -242,8 +336,22 @@ def deseasonalize_price(df):
     print(f"Hydro_Reserves: Seasonal R² = {hydro_model.rsquared:.4f}")
     print(f"  Original std: {df['Hydro_Reserves'].std():.2f}, Deseasonalized std: {df['Hydro_Reserves_Deseasonalized'].std():.2f}")
 
+    # Deseasonalize Oil_Price (if available)
+    if 'Oil_Price' in df.columns:
+        oil_model = sm.OLS(df['Oil_Price'], seasonal_dummies).fit()
+        df['Oil_Price_Deseasonalized'] = oil_model.resid
+        print(f"Oil_Price: Seasonal R² = {oil_model.rsquared:.4f}")
+        print(f"  Original std: {df['Oil_Price'].std():.2f}, Deseasonalized std: {df['Oil_Price_Deseasonalized'].std():.2f}")
+
+    # Deseasonalize Gas_Price (if available)
+    if 'Gas_Price' in df.columns:
+        gas_model = sm.OLS(df['Gas_Price'], seasonal_dummies).fit()
+        df['Gas_Price_Deseasonalized'] = gas_model.resid
+        print(f"Gas_Price: Seasonal R² = {gas_model.rsquared:.4f}")
+        print(f"  Original std: {df['Gas_Price'].std():.2f}, Deseasonalized std: {df['Gas_Price_Deseasonalized'].std():.2f}")
+
     # Clean up temporary columns
-    df = df.drop(columns=['Year', 'Month', 'DayOfWeek', 'Hour'])
+    df = df.drop(columns=['Year', 'Month', 'DayOfWeek', 'Hour', 'Holiday'])
 
     print("Note: Wind_Forecast and Net_Exchange are NOT deseasonalized (following Fredriksson)")
 
@@ -254,11 +362,12 @@ def apply_log_transform(df, use_deseasonalized=False):
     """
     Apply logarithmic transformation to variables following Fredriksson (2016).
 
-    Logs applied to: Price, Wind_Forecast, Hydro_Reserves, Consumption
+    Logs applied to: Price, Wind_Forecast, Hydro_Reserves, Consumption, Oil_Price
     NOT logged: Net_Exchange (can contain negative values)
 
-    Note: Fredriksson logs demand/hydro AFTER deseasonalization,
-    but wind production is logged directly (not deseasonalized).
+    Note: Fredriksson logs Price, Demand, Hydro, and Oil AFTER deseasonalization,
+    but Wind production is logged directly (not deseasonalized).
+    Gas Price is also logged directly (Fredriksson does not mention deseasonalizing gas).
     """
     print("\n--- APPLYING LOGARITHMIC TRANSFORMATION ---")
 
@@ -300,6 +409,28 @@ def apply_log_transform(df, use_deseasonalized=False):
 
     # Net_Exchange - NOT logged (can be negative)
     print(f"Net_Exchange: NOT logged (contains negative values)")
+
+    # Oil price - use deseasonalized if available (Fredriksson methodology)
+    if 'Oil_Price' in df.columns:
+        if use_deseasonalized and 'Oil_Price_Deseasonalized' in df.columns:
+            oil_shifted = df['Oil_Price_Deseasonalized'] + df['Oil_Price'].mean()
+            oil_shifted = oil_shifted.clip(lower=0.01)
+            df['Oil_Price_Log'] = np.log(oil_shifted)
+            print(f"Oil_Price: log(deseasonalized + mean) applied [USD/barrel]")
+        else:
+            df['Oil_Price_Log'] = np.log(df['Oil_Price'].clip(lower=0.01))
+            print(f"Oil_Price: log(raw) applied [USD/barrel]")
+
+    # Gas price - use deseasonalized if available (same treatment as Oil)
+    if 'Gas_Price' in df.columns:
+        if use_deseasonalized and 'Gas_Price_Deseasonalized' in df.columns:
+            gas_shifted = df['Gas_Price_Deseasonalized'] + df['Gas_Price'].mean()
+            gas_shifted = gas_shifted.clip(lower=0.01)
+            df['Gas_Price_Log'] = np.log(gas_shifted)
+            print(f"Gas_Price: log(deseasonalized + mean) applied [EUR/MWh]")
+        else:
+            df['Gas_Price_Log'] = np.log(df['Gas_Price'].clip(lower=0.01))
+            print(f"Gas_Price: log(raw) applied [EUR/MWh]")
 
     return df
 
@@ -519,10 +650,20 @@ def perform_multivariate_analysis(df, zone, use_deseasonalized=False, use_log_tr
         print("Using: Log-transformed variables (Fredriksson methodology)")
         # Use logged versions of variables
         exog_vars = ['Wind_Forecast_Log', 'Hydro_Reserves_Log', 'Net_Exchange', 'Consumption_Log']
+        # Add commodity controls if available
+        if 'Oil_Price_Log' in df.columns:
+            exog_vars.append('Oil_Price_Log')
+        if 'Gas_Price_Log' in df.columns:
+            exog_vars.append('Gas_Price_Log')
         Y = df['Price_Log']
     else:
         # Use raw variables
         exog_vars = ['Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']
+        # Add commodity controls if available
+        if 'Oil_Price' in df.columns:
+            exog_vars.append('Oil_Price')
+        if 'Gas_Price' in df.columns:
+            exog_vars.append('Gas_Price')
         if use_deseasonalized:
             print("Using: Log of Deseasonalized Price")
             price_shifted = df['Price_Deseasonalized'] + df['Price'].mean()
@@ -531,6 +672,8 @@ def perform_multivariate_analysis(df, zone, use_deseasonalized=False, use_log_tr
         else:
             print("Using: Raw Price")
             Y = df['Price']
+
+    print(f"Exogenous variables: {exog_vars}")
 
     X = sm.add_constant(df[exog_vars])
 
@@ -992,12 +1135,12 @@ if __name__ == "__main__":
     # Toggle for logarithmic transformation (Fredriksson 2016 methodology)
     # When True: applies log() to Price, Wind_Forecast, Hydro_Reserves, Consumption
     # Net_Exchange is NOT logged (can contain negative values)
-    USE_LOG_TRANSFORM = False
+    USE_LOG_TRANSFORM = True
 
     # Toggle for linear interpolation of missing values
     # When True: fills missing values by linear interpolation between surrounding values
     # When False: drops all rows with missing values (original behavior)
-    USE_LINEAR_INTERPOLATION = False
+    USE_LINEAR_INTERPOLATION = True
 
     # --- DIAGNOSTIC TEST TOGGLES (Fredriksson 2016 methodology) ---
     # Toggle for Ljung-Box test for autocorrelation
@@ -1027,7 +1170,8 @@ if __name__ == "__main__":
         'wind': 'master data files/Master_Wind_Forecast_Merged_2021_2024.xlsx',
         'hydro': 'master data files/Master_Hydro_Reservoir.xlsx',
         'exch': 'master data files/Master_Exchange_Merged_2021_2024.xlsx',
-        'cons': 'master data files/Master_Consumption_2021_2024.xlsx'
+        'cons': 'master data files/Master_Consumption_2021_2024.xlsx',
+        'commodities': 'master data files/Master_Commodities.xlsx'
     }
 
     try:
