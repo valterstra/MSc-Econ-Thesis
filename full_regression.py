@@ -275,9 +275,21 @@ def handle_outliers_fredriksson(df, use_log_transform=False, use_deseasonalized=
     # Identify outliers
     outliers = (data > upper_threshold) | (data < lower_threshold)
     n_outliers = outliers.sum()
+    pct_outliers = (n_outliers / len(data)) * 100
 
     if n_outliers > 0:
-        print(f"  Found {n_outliers} outliers to replace")
+        # Count upper vs lower outliers
+        upper_outliers = (data > upper_threshold).sum()
+        lower_outliers = (data < lower_threshold).sum()
+
+        print(f"\n  {'='*70}")
+        print(f"  OUTLIER SUMMARY")
+        print(f"  {'='*70}")
+        print(f"  Total outliers found: {n_outliers} ({pct_outliers:.2f}% of data)")
+        print(f"  Total observations: {len(data)}")
+        print(f"    Upper outliers (>{upper_threshold:.2f}): {upper_outliers}")
+        print(f"    Lower outliers (<{lower_threshold:.2f}): {lower_outliers}")
+        print(f"\n  Replacing with mean of ±24h and ±48h surrounding values...")
 
         # Replace each outlier with mean of surrounding hours
         outlier_indices = data[outliers].index
@@ -307,7 +319,7 @@ def handle_outliers_fredriksson(df, use_log_transform=False, use_deseasonalized=
                 replacement_value = np.mean(surrounding_values)
                 original_value = data.iloc[pos]
                 data.iloc[pos] = replacement_value
-                # Individual outlier replacements not printed (too verbose for 771 outliers)
+                # Individual outlier replacements not printed (too verbose)
 
         # Update the dataframe
         df_clean[price_col] = data
@@ -316,26 +328,187 @@ def handle_outliers_fredriksson(df, use_log_transform=False, use_deseasonalized=
         new_mean = data.mean()
         new_std = data.std()
 
-        print(f"  After replacement:")
-        print(f"    Mean: {mean_val:.2f} -> {new_mean:.2f}")
-        print(f"    Std: {std_val:.2f} -> {new_std:.2f}")
+        print(f"\n  Statistics before vs. after replacement:")
+        print(f"    Mean: {mean_val:.4f} -> {new_mean:.4f} (change: {new_mean - mean_val:.4f})")
+        print(f"    Std:  {std_val:.4f} -> {new_std:.4f} (change: {new_std - std_val:.4f})")
+        print(f"  {'='*70}")
 
         outlier_stats[price_col] = {
             'n_outliers': n_outliers,
+            'n_upper': upper_outliers,
+            'n_lower': lower_outliers,
             'original_mean': mean_val,
             'original_std': std_val,
             'new_mean': new_mean,
             'new_std': new_std
         }
     else:
-        print(f"  No outliers found")
+        print(f"\n  No outliers found")
         outlier_stats[price_col] = {
             'n_outliers': 0,
+            'n_upper': 0,
+            'n_lower': 0,
             'original_mean': mean_val,
             'original_std': std_val,
             'new_mean': mean_val,
             'new_std': std_val
         }
+
+    return df_clean, outlier_stats
+
+
+def handle_outliers_gianfreda(df, use_log_transform=False, use_deseasonalized=False):
+    """
+    Replace outliers using Gianfreda (2010) / Mugele et al. (2005) methodology.
+
+    Outlier definition:
+    - Exceeds 3x standard deviation above or below the mean (symmetric threshold)
+
+    Replacement method:
+    - Replace outlier with 3*std value for the respective weekday
+    - Each weekday has its own 3σ threshold (Monday outliers capped at Monday's 3σ, etc.)
+
+    Parameters:
+    - use_log_transform: If True, works on logged price
+    - use_deseasonalized: If True, works on deseasonalized logged price
+
+    Returns:
+    - DataFrame with outliers replaced in Price
+    - Dictionary with outlier statistics
+    """
+
+    print("\n" + "="*80)
+    print("OUTLIER HANDLING - GIANFREDA (2010) / MUGELE ET AL. (2005) METHODOLOGY")
+    print("="*80)
+
+    # Determine which Price column to use based on flags
+    if use_log_transform and use_deseasonalized:
+        if 'Price_Log_Deseasonalized' in df.columns:
+            price_col = 'Price_Log_Deseasonalized'
+            print("Applying to: Logged and Deseasonalized Price")
+        else:
+            print("Warning: Price_Log_Deseasonalized not found. Cannot apply outlier handling.")
+            return df, {}
+    elif use_log_transform:
+        if 'Price_Log' in df.columns:
+            price_col = 'Price_Log'
+            print("Applying to: Logged Price")
+        else:
+            print("Warning: Price_Log not found. Cannot apply outlier handling.")
+            return df, {}
+    else:
+        price_col = 'Price'
+        print("Applying to: Raw Price")
+
+    print("Replacing outliers with ±3*std threshold for respective weekday")
+    print("Note: Outlier handling only applied to Price, not explanatory variables\n")
+
+    df_clean = df.copy()
+    outlier_stats = {}
+
+    print(f"\nProcessing: {price_col}")
+
+    data = df_clean[price_col].copy()
+
+    # Extract day of week (0=Monday, 6=Sunday)
+    df_clean['DayOfWeek'] = df_clean.index.dayofweek
+
+    # Calculate overall statistics
+    overall_mean = data.mean()
+    overall_std = data.std()
+
+    print(f"  Overall Mean: {overall_mean:.2f}")
+    print(f"  Overall Std Dev: {overall_std:.2f}")
+    print(f"  Overall ±3*std threshold: [{overall_mean - 3*overall_std:.2f}, {overall_mean + 3*overall_std:.2f}]")
+
+    # Calculate weekday-specific statistics and thresholds
+    print("\n  Weekday-specific thresholds:")
+    weekday_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    weekday_stats = {}
+
+    for day in range(7):
+        day_mask = df_clean['DayOfWeek'] == day
+        day_data = data[day_mask]
+        day_mean = day_data.mean()
+        day_std = day_data.std()
+
+        weekday_stats[day] = {
+            'mean': day_mean,
+            'std': day_std,
+            'upper_threshold': day_mean + 3 * day_std,
+            'lower_threshold': day_mean - 3 * day_std,
+            'cap_value': 3 * day_std  # The replacement value (3σ for this weekday)
+        }
+
+        print(f"    {weekday_names[day]}: mean={day_mean:.2f}, std={day_std:.2f}, "
+              f"threshold=[{weekday_stats[day]['lower_threshold']:.2f}, {weekday_stats[day]['upper_threshold']:.2f}]")
+
+    # Identify and replace outliers by weekday (using vectorized operations)
+    total_outliers = 0
+    outliers_by_day = {day: 0 for day in range(7)}
+
+    for day in range(7):
+        day_mask = df_clean['DayOfWeek'] == day
+
+        upper_threshold = weekday_stats[day]['upper_threshold']
+        lower_threshold = weekday_stats[day]['lower_threshold']
+
+        # Identify upper outliers for this weekday
+        upper_outliers = day_mask & (data > upper_threshold)
+        n_upper = upper_outliers.sum()
+        if n_upper > 0:
+            data[upper_outliers] = upper_threshold
+            outliers_by_day[day] += n_upper
+            total_outliers += n_upper
+
+        # Identify lower outliers for this weekday
+        lower_outliers = day_mask & (data < lower_threshold)
+        n_lower = lower_outliers.sum()
+        if n_lower > 0:
+            data[lower_outliers] = lower_threshold
+            outliers_by_day[day] += n_lower
+            total_outliers += n_lower
+
+    # Update the dataframe
+    df_clean[price_col] = data
+
+    # Calculate outlier percentage
+    pct_outliers = (total_outliers / len(data)) * 100
+
+    print(f"\n  {'='*70}")
+    print(f"  OUTLIER SUMMARY")
+    print(f"  {'='*70}")
+    print(f"  Total outliers found and replaced: {total_outliers} ({pct_outliers:.2f}% of data)")
+    print(f"  Total observations: {len(data)}")
+    print(f"\n  Outliers by weekday:")
+    for day in range(7):
+        if outliers_by_day[day] > 0:
+            pct_day = (outliers_by_day[day] / total_outliers) * 100 if total_outliers > 0 else 0
+            print(f"    {weekday_names[day]}: {outliers_by_day[day]} ({pct_day:.1f}% of outliers)")
+        else:
+            print(f"    {weekday_names[day]}: 0")
+
+    # Recalculate statistics after replacement
+    new_mean = data.mean()
+    new_std = data.std()
+
+    print(f"\n  Statistics before vs. after replacement:")
+    print(f"    Mean: {overall_mean:.4f} -> {new_mean:.4f} (change: {new_mean - overall_mean:.4f})")
+    print(f"    Std:  {overall_std:.4f} -> {new_std:.4f} (change: {new_std - overall_std:.4f})")
+    print(f"  {'='*70}")
+
+    outlier_stats[price_col] = {
+        'n_outliers': total_outliers,
+        'outliers_by_weekday': outliers_by_day,
+        'original_mean': overall_mean,
+        'original_std': overall_std,
+        'new_mean': new_mean,
+        'new_std': new_std,
+        'weekday_stats': weekday_stats
+    }
+
+    # Clean up temporary column
+    df_clean = df_clean.drop(columns=['DayOfWeek'])
 
     return df_clean, outlier_stats
 
@@ -912,6 +1085,185 @@ def run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, use_log_transform=True,
     return beta_t, se_t, tvp_results
 
 
+def run_rolling_window_analysis(df, zone, Y, exog_vars, use_log_transform,
+                                window_years=3, step_years=1, min_obs=24*180,
+                                plots_dir="plots", results_dir="results"):
+    """
+    Estimate wind coefficient using overlapping rolling windows with OLS.
+
+    Parameters:
+    - df: DataFrame with all variables
+    - zone: Price zone identifier
+    - Y: Dependent variable (Series)
+    - exog_vars: List of exogenous variable column names
+    - use_log_transform: Whether log transformation was applied
+    - window_years: Size of each rolling window in years
+    - step_years: Step size between windows in years
+    - min_obs: Minimum observations required per window
+    - plots_dir: Directory for saving plots
+    - results_dir: Directory for saving CSV results
+
+    Returns: None (saves outputs to files)
+    """
+    from dateutil.relativedelta import relativedelta
+
+    print("\n" + "="*80)
+    print("ROLLING-WINDOW WIND COEFFICIENT ESTIMATION")
+    print("="*80)
+    print(f"\nConfiguration:")
+    print(f"  Window size: {window_years} years")
+    print(f"  Step size: {step_years} year(s)")
+    print(f"  Minimum observations per window: {min_obs:,}")
+
+    # Identify wind column from exog_vars
+    wind_col = [col for col in exog_vars if 'Wind' in col and 'Forecast' in col][0]
+    control_cols = [col for col in exog_vars if col != wind_col]
+
+    print(f"\nTarget variable: {wind_col}")
+    print(f"Control variables: {control_cols}")
+
+    # Prepare clean data
+    cols_needed = [Y.name] + exog_vars
+    tmp = df[cols_needed].dropna().copy()
+    tmp = tmp.sort_index()
+
+    print(f"\nData range: {tmp.index.min()} to {tmp.index.max()}")
+    print(f"Total observations after cleaning: {len(tmp):,}")
+
+    # Define rolling windows by calendar time
+    results = []
+    start_date = tmp.index.min()
+    end_of_data = tmp.index.max()
+
+    window_count = 0
+    print(f"\n--- Estimating Rolling Windows ---")
+
+    while True:
+        window_end = start_date + relativedelta(years=window_years)
+        if window_end > end_of_data:
+            break
+
+        window_data = tmp[(tmp.index >= start_date) & (tmp.index < window_end)]
+
+        if len(window_data) >= min_obs:
+            window_count += 1
+
+            # Run OLS regression with Newey-West (HAC) standard errors
+            X = sm.add_constant(window_data[exog_vars])
+            y = window_data[Y.name]
+            model = sm.OLS(y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 24})
+
+            # Calculate window midpoint
+            window_midpoint = start_date + relativedelta(months=window_years * 6)
+
+            # Record results
+            results.append({
+                'window_start': start_date,
+                'window_end': window_end,
+                'window_midpoint': window_midpoint,
+                'beta_wind': model.params[wind_col],
+                'se_wind': model.bse[wind_col],
+                't_stat': model.tvalues[wind_col],
+                'pvalue': model.pvalues[wind_col],
+                'n_obs': len(window_data),
+                'r_squared': model.rsquared
+            })
+
+            print(f"  Window {window_count}: {start_date.strftime('%Y-%m-%d')} to "
+                  f"{window_end.strftime('%Y-%m-%d')} | n={len(window_data):,} | "
+                  f"beta={model.params[wind_col]:.6f} | p={model.pvalues[wind_col]:.4f}")
+
+        start_date = start_date + relativedelta(years=step_years)
+
+    if not results:
+        print("\nWARNING: No valid windows found. Check data range and window parameters.")
+        return
+
+    # Create results DataFrame
+    results_df = pd.DataFrame(results)
+
+    # Print summary statistics
+    print("\n" + "="*80)
+    print("ROLLING-WINDOW SUMMARY STATISTICS")
+    print("="*80)
+    print(f"\nNumber of windows analyzed: {len(results_df)}")
+    print(f"\nWind coefficient (beta):")
+    print(f"  Mean:   {results_df['beta_wind'].mean():.6f}")
+    print(f"  Std:    {results_df['beta_wind'].std():.6f}")
+    print(f"  Min:    {results_df['beta_wind'].min():.6f}")
+    print(f"  Max:    {results_df['beta_wind'].max():.6f}")
+
+    sig_count = (results_df['pvalue'] < 0.05).sum()
+    print(f"\nSignificance at 5% level: {sig_count}/{len(results_df)} windows "
+          f"({100*sig_count/len(results_df):.1f}%)")
+
+    # Create results directory if needed
+    os.makedirs(results_dir, exist_ok=True)
+
+    # Save CSV output
+    csv_path = os.path.join(results_dir, f'rolling_wind_coef_{zone}.csv')
+    results_df.to_csv(csv_path, index=False)
+    print(f"\nSaved results to: {csv_path}")
+
+    # Create and save plot
+    os.makedirs(plots_dir, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+
+    # Convert midpoints to datetime for plotting
+    midpoints = pd.to_datetime(results_df['window_midpoint'])
+    beta_values = results_df['beta_wind'].values
+    se_values = results_df['se_wind'].values
+
+    # Calculate 95% confidence intervals
+    upper_95 = beta_values + 1.96 * se_values
+    lower_95 = beta_values - 1.96 * se_values
+
+    # Plot coefficient with confidence bands
+    ax.plot(midpoints, beta_values, color='blue', linewidth=2, marker='o',
+            markersize=6, label=r'$\beta_{wind}$ coefficient')
+    ax.fill_between(midpoints, lower_95, upper_95, color='blue', alpha=0.2,
+                    label='95% CI')
+
+    # Add horizontal line at zero
+    ax.axhline(y=0, color='black', linestyle='--', linewidth=0.8, alpha=0.5,
+               label='Zero')
+
+    # Add horizontal line at mean
+    mean_beta = results_df['beta_wind'].mean()
+    ax.axhline(y=mean_beta, color='red', linestyle=':', linewidth=1.5,
+               label=f'Mean = {mean_beta:.4f}')
+
+    ax.set_title(f'Rolling-Window Wind Coefficient - {zone}\n'
+                 f'({window_years}-year windows, {step_years}-year steps, Newey-West SE)',
+                 fontsize=14, fontweight='bold')
+    ax.set_xlabel('Window Midpoint', fontsize=12)
+    ax.set_ylabel(r'$\beta_{wind}$ (Wind Coefficient)', fontsize=12)
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    # Add annotation with key statistics
+    stats_text = (f'Windows: {len(results_df)}\n'
+                  f'Mean: {mean_beta:.4f}\n'
+                  f'Std: {results_df["beta_wind"].std():.4f}\n'
+                  f'Sig (p<0.05): {sig_count}/{len(results_df)}')
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+            fontsize=10, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+    plt.tight_layout()
+
+    # Save plot
+    plot_path = os.path.join(plots_dir, f'rolling_wind_coef_{zone}.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"Saved plot to: {plot_path}")
+    plt.close()
+
+    print("\n" + "="*80)
+    print("ROLLING-WINDOW ANALYSIS COMPLETE")
+    print("="*80)
+
+
 def select_armax_lags_aic(Y, exog_vars, max_p=10, max_q=10):
     """
     Automated lag selection for ARMAX model using AIC minimization.
@@ -978,7 +1330,9 @@ def select_armax_lags_aic(Y, exog_vars, max_p=10, max_q=10):
 
 def perform_multivariate_analysis(df, zone, use_log_transform=False, use_deseasonalized=False,
                                  run_ljungbox=False, run_hetero_tests=False, run_stationarity=False,
-                                 optimize_armax_lags=False, run_tvp_wind_kalman=False):
+                                 optimize_armax_lags=False, run_tvp_wind_kalman=False,
+                                 run_rolling_window=False, rolling_window_years=3,
+                                 rolling_step_years=1, rolling_min_obs=24*180):
     """
     Runs OLS and ARMAX-GARCHX with full control variables and optional diagnostic tests.
 
@@ -1050,6 +1404,16 @@ def perform_multivariate_analysis(df, zone, use_log_transform=False, use_deseaso
     # TVP Kalman Filter mode: run time-varying parameter analysis and return early
     if run_tvp_wind_kalman:
         run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, use_log_transform, plots_dir="plots")
+        return None, None  # Early return, skip OLS/ARMAX
+
+    # Rolling-window mode: run rolling window analysis and return early
+    if run_rolling_window:
+        run_rolling_window_analysis(df, zone, Y, exog_vars, use_log_transform,
+                                    window_years=rolling_window_years,
+                                    step_years=rolling_step_years,
+                                    min_obs=rolling_min_obs,
+                                    plots_dir="plots",
+                                    results_dir="results")
         return None, None  # Early return, skip OLS/ARMAX
 
     X = sm.add_constant(df[exog_vars])
@@ -1506,12 +1870,22 @@ if __name__ == "__main__":
     # STANDARD APPROACH: Deseasonalization is applied to LOGGED series (after log transformation)
     USE_DESEASONALIZED = True
 
-    # --- OUTLIER HANDLING TOGGLE ---
-    # Toggle for outlier replacement using Fredriksson (2016) methodology
-    # When True: replaces outliers with mean of 24 and 48 hours before/after
+    # --- OUTLIER HANDLING TOGGLES ---
+    # Toggle for outlier replacement
+    # When True: replaces outliers using selected method
     # When False: keeps outliers in the data (no replacement)
-    #
-    # METHODOLOGICAL NOTE - DEVIATION FROM FREDRIKSSON:
+    HANDLE_OUTLIERS = True
+
+    # Outlier handling method selection
+    # 'fredriksson': Fredriksson (2016) methodology
+    #   - Threshold: +6σ / -3.7σ (asymmetric)
+    #   - Replacement: Mean of 24h and 48h before/after outlier
+    # 'gianfreda': Gianfreda (2010) / Mugele et al. (2005) methodology
+    #   - Threshold: ±3σ (symmetric)
+    #   - Replacement: Capped at ±3σ for respective weekday
+    OUTLIER_METHOD = 'fredriksson'  # Options: 'fredriksson' or 'gianfreda'
+
+    # METHODOLOGICAL NOTE:
     # Fredriksson (2016) applies outlier filter TWICE:
     #   1st: On original price series (found 31 outliers)
     #   2nd: On deseasonalized price series (found 42 outliers)
@@ -1520,12 +1894,11 @@ if __name__ == "__main__":
     # Rationale:
     #   - Seasonal patterns mask true outliers (e.g., high winter prices vs low summer)
     #   - Log transformation stabilizes variance
-    #   - Deseasonalized mean ≈ 0 makes 6σ threshold more meaningful
+    #   - Deseasonalized mean ≈ 0 makes threshold more meaningful
     #   - Cleaner single-pass approach with stronger statistical justification
     #   - Fredriksson provides no theoretical justification for double application
     #
     # TODO: Future sensitivity analysis could compare single vs. double application
-    HANDLE_OUTLIERS = True
 
     # Toggle for linear interpolation of missing values
     # When True: fills missing values by linear interpolation between surrounding values
@@ -1541,16 +1914,16 @@ if __name__ == "__main__":
     # --- DIAGNOSTIC TEST TOGGLES (Fredriksson 2016 methodology) ---
     # Toggle for Ljung-Box test for autocorrelation
     # Tests whether residuals exhibit autocorrelation at various lag lengths
-    RUN_LJUNGBOX_TEST = True
+    RUN_LJUNGBOX_TEST = False
 
     # Toggle for heteroskedasticity and ARCH effects tests
     # Includes Engle's ARCH test and Ljung-Box Q test on squared residuals
     # If ARCH effects detected, consider implementing GARCHX model
-    RUN_HETEROSKEDASTICITY_TESTS = True
+    RUN_HETEROSKEDASTICITY_TESTS = False
 
     # Toggle for stationarity tests (ADF and DF-GLS)
     # Tests whether price series has a unit root (non-stationary)
-    RUN_STATIONARITY_TESTS = True
+    RUN_STATIONARITY_TESTS = False
 
     # --- MODEL SPECIFICATION TOGGLES ---
     # Toggle for automated ARMAX lag selection via AIC minimization
@@ -1562,7 +1935,17 @@ if __name__ == "__main__":
     # --- TVP KALMAN FILTER TOGGLE ---
     # When True: estimates time-varying wind coefficient using state-space model
     # When False: runs standard OLS + ARMAX analysis
-    RUN_TVP_WIND_KALMAN = True
+    RUN_TVP_WIND_KALMAN = False
+
+    # --- ROLLING-WINDOW ESTIMATION TOGGLE ---
+    # When True: estimates wind coefficient using overlapping rolling windows (skips OLS/ARMAX)
+    # When False: runs standard full-sample analysis
+    RUN_ROLLING_WINDOW = True
+
+    # Rolling window configuration
+    ROLLING_WINDOW_YEARS = 1          # Window size in years
+    ROLLING_STEP_YEARS = 1            # Step size between windows in years
+    ROLLING_MIN_OBS = 24 * 180        # Minimum observations per window (6 months hourly data)
 
     # Updated paths matching your local project directory
     # Master data files are stored in 'master data files/' folder
@@ -1609,11 +1992,18 @@ if __name__ == "__main__":
         # This provides the most meaningful outlier detection:
         #   - Log transformation stabilizes variance
         #   - Deseasonalization removes seasonal patterns
-        #   - 6σ threshold more meaningful on transformed data
+        #   - Threshold more meaningful on transformed data
         if HANDLE_OUTLIERS:
-            data, outlier_stats = handle_outliers_fredriksson(data,
-                                                              use_log_transform=USE_LOG_TRANSFORM,
-                                                              use_deseasonalized=USE_DESEASONALIZED)
+            if OUTLIER_METHOD == 'fredriksson':
+                data, outlier_stats = handle_outliers_fredriksson(data,
+                                                                  use_log_transform=USE_LOG_TRANSFORM,
+                                                                  use_deseasonalized=USE_DESEASONALIZED)
+            elif OUTLIER_METHOD == 'gianfreda':
+                data, outlier_stats = handle_outliers_gianfreda(data,
+                                                                use_log_transform=USE_LOG_TRANSFORM,
+                                                                use_deseasonalized=USE_DESEASONALIZED)
+            else:
+                raise ValueError(f"Unknown outlier method: {OUTLIER_METHOD}. Choose 'fredriksson' or 'gianfreda'.")
 
         # --- STEP 5: REGRESSION ANALYSIS ---
         # Run regression models with optional diagnostic tests
@@ -1625,7 +2015,11 @@ if __name__ == "__main__":
                                       run_hetero_tests=RUN_HETEROSKEDASTICITY_TESTS,
                                       run_stationarity=RUN_STATIONARITY_TESTS,
                                       optimize_armax_lags=OPTIMIZE_ARMAX_LAGS,
-                                      run_tvp_wind_kalman=RUN_TVP_WIND_KALMAN)
+                                      run_tvp_wind_kalman=RUN_TVP_WIND_KALMAN,
+                                      run_rolling_window=RUN_ROLLING_WINDOW,
+                                      rolling_window_years=ROLLING_WINDOW_YEARS,
+                                      rolling_step_years=ROLLING_STEP_YEARS,
+                                      rolling_min_obs=ROLLING_MIN_OBS)
 
     except Exception as e:
         print(f"Critical error during execution: {e}")
