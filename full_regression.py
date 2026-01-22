@@ -12,7 +12,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import gaussian_kde
 
-
 # --- 1. DATA LOADING FUNCTIONS ---
 
 def load_commodities(path):
@@ -116,18 +115,39 @@ def load_all_thesis_data(paths, zone_price='SE1', zone_wind='S1', zone_hydro='SE
     # Handle missing values based on configuration
     if use_interpolation:
         print("\n--- APPLYING LINEAR INTERPOLATION FOR MISSING VALUES ---")
-        missing_before = final_df.isna().sum().sum()
+
+        # Show detailed breakdown of missing values by variable
+        missing_by_var = final_df.isna().sum()
+        missing_before = missing_by_var.sum()
+
+        print(f"\nMissing values by variable (before interpolation):")
+        for var, count in missing_by_var.items():
+            if count > 0:
+                pct = (count / len(final_df)) * 100
+                print(f"  {var}: {count} ({pct:.2f}%)")
+
+        print(f"\nTotal missing values: {missing_before}")
+
         # Apply linear interpolation to fill missing values
         final_df = final_df.interpolate(method='linear', limit_direction='both')
         # Drop any remaining NaN values (e.g., at edges if interpolation couldn't fill)
         final_df = final_df.dropna()
         missing_after = final_df.isna().sum().sum()
-        print(f"Missing values before interpolation: {missing_before}")
         print(f"Missing values after interpolation: {missing_after}")
         print(f"Rows retained: {len(final_df)}")
     else:
         # Original behavior: drop all rows with missing values
         rows_before = len(final_df)
+
+        # Show detailed breakdown of missing values by variable
+        missing_by_var = final_df.isna().sum()
+        if missing_by_var.sum() > 0:
+            print(f"\nMissing values by variable (before dropping rows):")
+            for var, count in missing_by_var.items():
+                if count > 0:
+                    pct = (count / len(final_df)) * 100
+                    print(f"  {var}: {count} ({pct:.2f}%)")
+
         final_df = final_df.dropna()
         rows_dropped = rows_before - len(final_df)
         if rows_dropped > 0:
@@ -138,7 +158,56 @@ def load_all_thesis_data(paths, zone_price='SE1', zone_wind='S1', zone_hydro='SE
 
 # --- 2. DATA PREPROCESSING FUNCTIONS ---
 
-def handle_outliers_fredriksson(df, use_deseasonalized=False):
+def lag_commodity_prices(df, lag_hours=24):
+    """
+    Lag commodity prices (oil and gas) by specified hours (default: 24 hours).
+
+    Rationale:
+    - Electricity spot prices are determined in day-ahead auctions (day D-1 for delivery on day D)
+    - Oil and gas prices should reflect information available at the time of bidding (24h before delivery)
+    - This aligns commodity prices with the information set used when electricity prices were set
+
+    Following standard practice in electricity price modeling literature (Weron, Huisman, etc.)
+
+    Parameters:
+    - df: DataFrame with Oil_Price and/or Gas_Price columns
+    - lag_hours: Number of hours to lag (default 24 for day-ahead market)
+
+    Returns:
+    - DataFrame with lagged commodity prices (NaN values from lagging are dropped)
+    """
+    print(f"\n--- LAGGING COMMODITY PRICES BY {lag_hours} HOURS ---")
+    print("Rationale: Day-ahead market pricing uses commodity prices from bidding time (D-1)")
+
+    rows_before_lag = len(df)
+
+    if 'Oil_Price' in df.columns:
+        oil_before = df['Oil_Price'].notna().sum()
+        df['Oil_Price'] = df['Oil_Price'].shift(lag_hours)
+        oil_after = df['Oil_Price'].notna().sum()
+        oil_lost = oil_before - oil_after
+        print(f"  Oil_Price: Lagged by {lag_hours}h ({oil_lost} observations lost at start)")
+
+    if 'Gas_Price' in df.columns:
+        gas_before = df['Gas_Price'].notna().sum()
+        df['Gas_Price'] = df['Gas_Price'].shift(lag_hours)
+        gas_after = df['Gas_Price'].notna().sum()
+        gas_lost = gas_before - gas_after
+        print(f"  Gas_Price: Lagged by {lag_hours}h ({gas_lost} observations lost at start)")
+
+    # Drop rows with NaN values created by lagging
+    df = df.dropna()
+    rows_after_drop = len(df)
+    rows_dropped = rows_before_lag - rows_after_drop
+
+    print(f"\nDropped {rows_dropped} rows with NaN values created by lagging")
+    print(f"Rows retained: {rows_after_drop}")
+    print("All subsequent transformations (log, deseasonalization) will use lagged commodity prices")
+
+    return df
+
+
+def handle_outliers_fredriksson(df, use_log_transform=False, use_deseasonalized=False):
     """
     Replace outliers using Fredriksson (2016) methodology.
 
@@ -151,7 +220,8 @@ def handle_outliers_fredriksson(df, use_deseasonalized=False):
     - Only applied to PRICE series, not explanatory variables
 
     Parameters:
-    - use_deseasonalized: If True, applies to deseasonalized Price. If False, to raw Price.
+    - use_log_transform: If True, works on logged price
+    - use_deseasonalized: If True, works on deseasonalized logged price
 
     Returns:
     - DataFrame with outliers replaced in Price
@@ -161,23 +231,33 @@ def handle_outliers_fredriksson(df, use_deseasonalized=False):
     print("\n" + "="*80)
     print("OUTLIER HANDLING - FREDRIKSSON (2016) METHODOLOGY")
     print("="*80)
-    if use_deseasonalized:
-        print("Applying to: Deseasonalized Price")
+
+    # Determine which Price column to use based on flags
+    if use_log_transform and use_deseasonalized:
+        if 'Price_Log_Deseasonalized' in df.columns:
+            price_col = 'Price_Log_Deseasonalized'
+            print("Applying to: Logged and Deseasonalized Price")
+        else:
+            print("Warning: Price_Log_Deseasonalized not found. Cannot apply outlier handling.")
+            return df, {}
+    elif use_log_transform:
+        if 'Price_Log' in df.columns:
+            price_col = 'Price_Log'
+            print("Applying to: Logged Price")
+        else:
+            print("Warning: Price_Log not found. Cannot apply outlier handling.")
+            return df, {}
     else:
+        price_col = 'Price'
         print("Applying to: Raw Price")
+
     print("Replacing outliers with mean of 24 and 48 hours before/after")
     print("Note: Outlier handling only applied to Price, not explanatory variables\n")
 
     df_clean = df.copy()
     outlier_stats = {}
 
-    # Determine which Price column to use
-    if use_deseasonalized and 'Price_Deseasonalized' in df.columns:
-        price_col = 'Price_Deseasonalized'
-        print(f"\nProcessing: {price_col}")
-    else:
-        price_col = 'Price'
-        print(f"\nProcessing: {price_col}")
+    print(f"\nProcessing: {price_col}")
 
     data = df_clean[price_col].copy()
     mean_val = data.mean()
@@ -227,17 +307,10 @@ def handle_outliers_fredriksson(df, use_deseasonalized=False):
                 replacement_value = np.mean(surrounding_values)
                 original_value = data.iloc[pos]
                 data.iloc[pos] = replacement_value
-                print(f"    {idx}: {original_value:.2f} -> {replacement_value:.2f}")
+                # Individual outlier replacements not printed (too verbose for 771 outliers)
 
         # Update the dataframe
         df_clean[price_col] = data
-
-        # If we modified deseasonalized price, also need to update the raw Price
-        # by adding back the seasonal component
-        if use_deseasonalized and price_col == 'Price_Deseasonalized':
-            # The raw Price is Price_Deseasonalized + seasonal component
-            # We need to update raw Price to reflect the outlier replacement
-            print(f"  Note: Deseasonalized outliers replaced. Raw Price updated accordingly.")
 
         # Recalculate statistics after replacement
         new_mean = data.mean()
@@ -267,18 +340,28 @@ def handle_outliers_fredriksson(df, use_deseasonalized=False):
     return df_clean, outlier_stats
 
 
-def deseasonalize_price(df):
+def deseasonalize_logged_variables(df):
     """
-    Remove seasonal patterns from Price, Consumption, Hydro_Reserves, Oil_Price, and Gas_Price using dummy variable regression.
+    Remove seasonal patterns from LOGGED variables using dummy variable regression.
     Based on Fredriksson (2016) methodology.
 
-    Creates dummies for: Year, Month, Day-of-Week, Hour, Holidays
-    Returns df with deseasonalized columns added for Price, Consumption, Hydro_Reserves, Oil_Price, and Gas_Price (if available).
+    STANDARD APPROACH: Deseasonalization is applied to LOGGED series (after log transformation).
 
-    Note: Wind is NOT deseasonalized (Fredriksson logs wind directly).
+    Seasonal dummies applied:
+    - Price_Log & Consumption_Log: Year, Month, Day-of-Week, Hour, Holidays (FULL deseasonalization)
+    - Hydro_Reserves_Log, Oil_Price_Log, Gas_Price_Log: Year, Month ONLY (PARTIAL deseasonalization)
+
+    Deseasonalizes: Price_Log, Consumption_Log, Hydro_Reserves_Log, Oil_Price_Log, Gas_Price_Log
+    Creates: Price_Log_Deseasonalized, Consumption_Log_Deseasonalized, etc.
+
+    Note: Wind_Forecast_Log is NOT deseasonalized (Fredriksson does not deseasonalize wind).
     Note: Net_Exchange is NOT deseasonalized (Fredriksson does not deseasonalize it).
     """
-    print("\n--- DESEASONALIZING VARIABLES (Fredriksson 2016 methodology) ---")
+    print("\n--- DESEASONALIZING LOGGED VARIABLES (Fredriksson 2016 methodology) ---")
+    print("Deseasonalization applied to LOGGED series (standard approach)")
+    print("\nDeseasonalization strategy:")
+    print("  - Price & Consumption: Year + Month + DOW + Hour + Holiday (FULL)")
+    print("  - Hydro, Oil, Gas: Year + Month ONLY (PARTIAL)")
 
     # Extract time components from Datetime index
     df['Year'] = df.index.year
@@ -292,10 +375,10 @@ def deseasonalize_price(df):
         import holidays
         swedish_holidays = holidays.Sweden(years=range(df.index.year.min(), df.index.year.max() + 1))
         df['Holiday'] = df.index.to_series().apply(lambda x: 1 if x.date() in swedish_holidays else 0).values
-        print("Holiday dummies created using Swedish holiday calendar")
+        print("\nHoliday dummies created using Swedish holiday calendar")
     except ImportError:
         # Fallback: simple holiday definition if holidays package not available
-        print("Warning: 'holidays' package not found. Using basic holiday definition.")
+        print("\nWarning: 'holidays' package not found. Using basic holiday definition.")
         print("Install with: pip install holidays")
         # Define basic holidays manually (New Year, Christmas, Midsummer, etc.)
         df['Holiday'] = 0
@@ -314,123 +397,159 @@ def deseasonalize_price(df):
     hour_dummies = pd.get_dummies(df['Hour'], prefix='Hour', drop_first=True, dtype=float)
     holiday_dummy = df[['Holiday']].astype(float)
 
-    # Combine all seasonal dummies
-    seasonal_dummies = pd.concat([year_dummies, month_dummies, dow_dummies, hour_dummies, holiday_dummy], axis=1)
-    seasonal_dummies = sm.add_constant(seasonal_dummies).astype(float)
+    # FULL seasonal dummies (for Price and Consumption)
+    seasonal_dummies_full = pd.concat([year_dummies, month_dummies, dow_dummies, hour_dummies, holiday_dummy], axis=1)
+    seasonal_dummies_full = sm.add_constant(seasonal_dummies_full).astype(float)
 
-    # Deseasonalize Price
-    price_model = sm.OLS(df['Price'], seasonal_dummies).fit()
-    df['Price_Deseasonalized'] = price_model.resid
-    print(f"Price: Seasonal R² = {price_model.rsquared:.4f}")
-    print(f"  Original std: {df['Price'].std():.2f}, Deseasonalized std: {df['Price_Deseasonalized'].std():.2f}")
+    # PARTIAL seasonal dummies (Year + Month only, for Hydro, Oil, Gas)
+    seasonal_dummies_partial = pd.concat([year_dummies, month_dummies], axis=1)
+    seasonal_dummies_partial = sm.add_constant(seasonal_dummies_partial).astype(float)
 
-    # Deseasonalize Consumption
-    consumption_model = sm.OLS(df['Consumption'], seasonal_dummies).fit()
-    df['Consumption_Deseasonalized'] = consumption_model.resid
-    print(f"Consumption: Seasonal R² = {consumption_model.rsquared:.4f}")
-    print(f"  Original std: {df['Consumption'].std():.2f}, Deseasonalized std: {df['Consumption_Deseasonalized'].std():.2f}")
+    print("\n--- Deseasonalizing with FULL seasonal controls (Year+Month+DOW+Hour+Holiday) ---")
 
-    # Deseasonalize Hydro_Reserves
-    hydro_model = sm.OLS(df['Hydro_Reserves'], seasonal_dummies).fit()
-    df['Hydro_Reserves_Deseasonalized'] = hydro_model.resid
-    print(f"Hydro_Reserves: Seasonal R² = {hydro_model.rsquared:.4f}")
-    print(f"  Original std: {df['Hydro_Reserves'].std():.2f}, Deseasonalized std: {df['Hydro_Reserves_Deseasonalized'].std():.2f}")
+    # Deseasonalize Price_Log (FULL)
+    price_log_model = sm.OLS(df['Price_Log'], seasonal_dummies_full).fit()
+    df['Price_Log_Deseasonalized'] = price_log_model.resid
+    print(f"Price_Log: Seasonal R² = {price_log_model.rsquared:.4f}")
+    print(f"  Original std: {df['Price_Log'].std():.4f}, Deseasonalized std: {df['Price_Log_Deseasonalized'].std():.4f}")
 
-    # Deseasonalize Oil_Price (if available)
-    if 'Oil_Price' in df.columns:
-        oil_model = sm.OLS(df['Oil_Price'], seasonal_dummies).fit()
-        df['Oil_Price_Deseasonalized'] = oil_model.resid
-        print(f"Oil_Price: Seasonal R² = {oil_model.rsquared:.4f}")
-        print(f"  Original std: {df['Oil_Price'].std():.2f}, Deseasonalized std: {df['Oil_Price_Deseasonalized'].std():.2f}")
+    # Deseasonalize Consumption_Log (FULL)
+    consumption_log_model = sm.OLS(df['Consumption_Log'], seasonal_dummies_full).fit()
+    df['Consumption_Log_Deseasonalized'] = consumption_log_model.resid
+    print(f"Consumption_Log: Seasonal R² = {consumption_log_model.rsquared:.4f}")
+    print(f"  Original std: {df['Consumption_Log'].std():.4f}, Deseasonalized std: {df['Consumption_Log_Deseasonalized'].std():.4f}")
 
-    # Deseasonalize Gas_Price (if available)
-    if 'Gas_Price' in df.columns:
-        gas_model = sm.OLS(df['Gas_Price'], seasonal_dummies).fit()
-        df['Gas_Price_Deseasonalized'] = gas_model.resid
-        print(f"Gas_Price: Seasonal R² = {gas_model.rsquared:.4f}")
-        print(f"  Original std: {df['Gas_Price'].std():.2f}, Deseasonalized std: {df['Gas_Price_Deseasonalized'].std():.2f}")
+    print("\n--- Deseasonalizing with PARTIAL seasonal controls (Year+Month ONLY) ---")
+
+    # Deseasonalize Hydro_Reserves_Log (PARTIAL - Year + Month only)
+    hydro_log_model = sm.OLS(df['Hydro_Reserves_Log'], seasonal_dummies_partial).fit()
+    df['Hydro_Reserves_Log_Deseasonalized'] = hydro_log_model.resid
+    print(f"Hydro_Reserves_Log: Seasonal R² = {hydro_log_model.rsquared:.4f}")
+    print(f"  Original std: {df['Hydro_Reserves_Log'].std():.4f}, Deseasonalized std: {df['Hydro_Reserves_Log_Deseasonalized'].std():.4f}")
+
+    # TEMPORARY: Visual check of deseasonalization
+    # Create temporary plots folder if it doesn't exist
+    temp_plots_dir = 'temporary plots'
+    if not os.path.exists(temp_plots_dir):
+        os.makedirs(temp_plots_dir)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 8))
+
+    # Plot original logged hydro
+    ax1.plot(df.index, df['Hydro_Reserves_Log'], color='blue', linewidth=0.5, alpha=0.7)
+    ax1.set_title('Hydro_Reserves_Log (Original - with seasonal patterns)', fontsize=14, fontweight='bold')
+    ax1.set_ylabel('Log(Hydro Reserves)', fontsize=12)
+    ax1.grid(True, alpha=0.3)
+
+    # Plot deseasonalized hydro
+    ax2.plot(df.index, df['Hydro_Reserves_Log_Deseasonalized'], color='green', linewidth=0.5, alpha=0.7)
+    ax2.set_title('Hydro_Reserves_Log_Deseasonalized (Year+Month patterns removed)', fontsize=14, fontweight='bold')
+    ax2.set_ylabel('Deseasonalized Log(Hydro)', fontsize=12)
+    ax2.set_xlabel('Date', fontsize=12)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    temp_plot_path = os.path.join(temp_plots_dir, 'TEMP_hydro_deseasonalization.png')
+    plt.savefig(temp_plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  TEMP: Saved hydro deseasonalization plot to {temp_plot_path}")
+    # END TEMPORARY
+
+    # Deseasonalize Oil_Price_Log (PARTIAL - Year + Month only)
+    if 'Oil_Price_Log' in df.columns:
+        oil_log_model = sm.OLS(df['Oil_Price_Log'], seasonal_dummies_partial).fit()
+        df['Oil_Price_Log_Deseasonalized'] = oil_log_model.resid
+        print(f"Oil_Price_Log: Seasonal R² = {oil_log_model.rsquared:.4f}")
+        print(f"  Original std: {df['Oil_Price_Log'].std():.4f}, Deseasonalized std: {df['Oil_Price_Log_Deseasonalized'].std():.4f}")
+
+    # Deseasonalize Gas_Price_Log (PARTIAL - Year + Month only)
+    if 'Gas_Price_Log' in df.columns:
+        gas_log_model = sm.OLS(df['Gas_Price_Log'], seasonal_dummies_partial).fit()
+        df['Gas_Price_Log_Deseasonalized'] = gas_log_model.resid
+        print(f"Gas_Price_Log: Seasonal R² = {gas_log_model.rsquared:.4f}")
+        print(f"  Original std: {df['Gas_Price_Log'].std():.4f}, Deseasonalized std: {df['Gas_Price_Log_Deseasonalized'].std():.4f}")
 
     # Clean up temporary columns
     df = df.drop(columns=['Year', 'Month', 'DayOfWeek', 'Hour', 'Holiday'])
 
-    print("Note: Wind_Forecast and Net_Exchange are NOT deseasonalized (following Fredriksson)")
+    print("\nNote: Wind_Forecast_Log and Net_Exchange are NOT deseasonalized (following Fredriksson)")
 
     return df
 
 
-def apply_log_transform(df, use_deseasonalized=False):
+def apply_log_transform(df):
     """
     Apply logarithmic transformation to variables following Fredriksson (2016).
+    STANDARD APPROACH: Log transformation is applied FIRST, then deseasonalization.
 
-    Logs applied to: Price, Wind_Forecast, Hydro_Reserves, Consumption, Oil_Price
+    Logs applied to: Price, Wind_Forecast, Hydro_Reserves, Consumption, Oil_Price, Gas_Price
     NOT logged: Net_Exchange (can contain negative values)
 
-    Note: Fredriksson logs Price, Demand, Hydro, and Oil AFTER deseasonalization,
-    but Wind production is logged directly (not deseasonalized).
-    Gas Price is also logged directly (Fredriksson does not mention deseasonalizing gas).
+    Note: Oil_Price and Gas_Price are already lagged by 24h (from lag_commodity_prices step)
+
+    Returns df with logged columns: Price_Log, Wind_Forecast_Log, Hydro_Reserves_Log,
+    Consumption_Log, Oil_Price_Log, Gas_Price_Log
     """
-    print("\n--- APPLYING LOGARITHMIC TRANSFORMATION ---")
+    print("\n--- APPLYING LOGARITHMIC TRANSFORMATION (STANDARD APPROACH) ---")
+    print("Log transformation applied BEFORE deseasonalization")
+    print("Note: Oil & Gas prices are already lagged by 24h (day-ahead market alignment)")
 
-    # Price transformation
-    if use_deseasonalized and 'Price_Deseasonalized' in df.columns:
-        # Shift deseasonalized residuals to positive range, then log
-        price_shifted = df['Price_Deseasonalized'] + df['Price'].mean()
-        price_shifted = price_shifted.clip(lower=0.01)
-        df['Price_Log'] = np.log(price_shifted)
-        print(f"Price: log(deseasonalized + mean) applied")
-    else:
-        # Log raw price directly
-        df['Price_Log'] = np.log(df['Price'].clip(lower=0.01))
-        print(f"Price: log(raw) applied")
+    # Log Price
+    df['Price_Log'] = np.log(df['Price'].clip(lower=0.01))
+    print(f"Price: log(raw) applied")
 
-    # Wind forecast - log directly (Fredriksson doesn't deseasonalize wind)
+    # Log Wind Forecast
     df['Wind_Forecast_Log'] = np.log(df['Wind_Forecast'].clip(lower=0.01))
     print(f"Wind_Forecast: log(raw) applied")
 
-    # Hydro reserves - use deseasonalized if available
-    if use_deseasonalized and 'Hydro_Reserves_Deseasonalized' in df.columns:
-        hydro_shifted = df['Hydro_Reserves_Deseasonalized'] + df['Hydro_Reserves'].mean()
-        hydro_shifted = hydro_shifted.clip(lower=0.01)
-        df['Hydro_Reserves_Log'] = np.log(hydro_shifted)
-        print(f"Hydro_Reserves: log(deseasonalized + mean) applied")
-    else:
-        df['Hydro_Reserves_Log'] = np.log(df['Hydro_Reserves'].clip(lower=0.01))
-        print(f"Hydro_Reserves: log(raw) applied")
+    # Log Hydro Reserves
+    df['Hydro_Reserves_Log'] = np.log(df['Hydro_Reserves'].clip(lower=0.01))
+    print(f"Hydro_Reserves: log(raw) applied")
 
-    # Consumption - use deseasonalized if available
-    if use_deseasonalized and 'Consumption_Deseasonalized' in df.columns:
-        consumption_shifted = df['Consumption_Deseasonalized'] + df['Consumption'].mean()
-        consumption_shifted = consumption_shifted.clip(lower=0.01)
-        df['Consumption_Log'] = np.log(consumption_shifted)
-        print(f"Consumption: log(deseasonalized + mean) applied")
-    else:
-        df['Consumption_Log'] = np.log(df['Consumption'].clip(lower=0.01))
-        print(f"Consumption: log(raw) applied")
+    # TEMPORARY: Visual check of log transformation
+    # Create temporary plots folder if it doesn't exist
+    temp_plots_dir = 'temporary plots'
+    if not os.path.exists(temp_plots_dir):
+        os.makedirs(temp_plots_dir)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 8))
+
+    # Plot raw hydro reserves
+    ax1.plot(df.index, df['Hydro_Reserves'], color='blue', linewidth=0.5, alpha=0.7)
+    ax1.set_title('Hydro_Reserves (Raw - original scale)', fontsize=14, fontweight='bold')
+    ax1.set_ylabel('Hydro Reserves (MWh)', fontsize=12)
+    ax1.grid(True, alpha=0.3)
+
+    # Plot logged hydro reserves
+    ax2.plot(df.index, df['Hydro_Reserves_Log'], color='orange', linewidth=0.5, alpha=0.7)
+    ax2.set_title('Hydro_Reserves_Log (Log transformed)', fontsize=14, fontweight='bold')
+    ax2.set_ylabel('Log(Hydro Reserves)', fontsize=12)
+    ax2.set_xlabel('Date', fontsize=12)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    temp_plot_path = os.path.join(temp_plots_dir, 'TEMP_hydro_log_transformation.png')
+    plt.savefig(temp_plot_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  TEMP: Saved hydro log transformation plot to {temp_plot_path}")
+    # END TEMPORARY
+
+    # Log Consumption
+    df['Consumption_Log'] = np.log(df['Consumption'].clip(lower=0.01))
+    print(f"Consumption: log(raw) applied")
 
     # Net_Exchange - NOT logged (can be negative)
     print(f"Net_Exchange: NOT logged (contains negative values)")
 
-    # Oil price - use deseasonalized if available (Fredriksson methodology)
+    # Log Oil Price (if available)
     if 'Oil_Price' in df.columns:
-        if use_deseasonalized and 'Oil_Price_Deseasonalized' in df.columns:
-            oil_shifted = df['Oil_Price_Deseasonalized'] + df['Oil_Price'].mean()
-            oil_shifted = oil_shifted.clip(lower=0.01)
-            df['Oil_Price_Log'] = np.log(oil_shifted)
-            print(f"Oil_Price: log(deseasonalized + mean) applied [USD/barrel]")
-        else:
-            df['Oil_Price_Log'] = np.log(df['Oil_Price'].clip(lower=0.01))
-            print(f"Oil_Price: log(raw) applied [USD/barrel]")
+        df['Oil_Price_Log'] = np.log(df['Oil_Price'].clip(lower=0.01))
+        print(f"Oil_Price: log(raw) applied [USD/barrel]")
 
-    # Gas price - use deseasonalized if available (same treatment as Oil)
+    # Log Gas Price (if available)
     if 'Gas_Price' in df.columns:
-        if use_deseasonalized and 'Gas_Price_Deseasonalized' in df.columns:
-            gas_shifted = df['Gas_Price_Deseasonalized'] + df['Gas_Price'].mean()
-            gas_shifted = gas_shifted.clip(lower=0.01)
-            df['Gas_Price_Log'] = np.log(gas_shifted)
-            print(f"Gas_Price: log(deseasonalized + mean) applied [EUR/MWh]")
-        else:
-            df['Gas_Price_Log'] = np.log(df['Gas_Price'].clip(lower=0.01))
-            print(f"Gas_Price: log(raw) applied [EUR/MWh]")
+        df['Gas_Price_Log'] = np.log(df['Gas_Price'].clip(lower=0.01))
+        print(f"Gas_Price: log(raw) applied [EUR/MWh]")
 
     return df
 
@@ -575,6 +694,224 @@ def run_stationarity_tests(series, series_name="Series"):
 
 # --- 4. MODELING FUNCTIONS ---
 
+def run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, use_log_transform=True, plots_dir="plots"):
+    """
+    Estimate time-varying parameter (TVP) model for the wind coefficient using state-space Kalman filter.
+
+    Model specification:
+        Observation: y_t = beta_t * w_t + controls_t' * gamma + e_t
+        State:       beta_t = beta_{t-1} + u_t
+
+    Uses Frisch-Waugh-Lovell partialling out to control for other regressors,
+    then estimates a random-walk state-space model for the wind coefficient.
+
+    **IMPORTANT - NEEDS FURTHER INVESTIGATION:**
+    Current implementation on hourly data shows excessive high-frequency volatility,
+    suggesting the model is overfitting to noise rather than capturing genuine
+    structural variation in the wind coefficient. The random walk state process
+    with unconstrained variance allows β_t to change hour-to-hour, which is
+    economically implausible.
+
+    Potential improvements to explore:
+    1. Aggregate to daily data (daily averages or peak prices) to reduce noise
+    2. Constrain state variance to force smoother evolution
+    3. Use AR(1) state process instead of random walk for mean reversion
+    4. Consider fixed-coefficient models with structural breaks instead
+    5. Estimate on rolling windows rather than full state-space approach
+
+    NOTE: Kalman filters may not be the optimal approach for analyzing coefficient
+    evolution over time in this context. Alternative methods (rolling regressions,
+    regime-switching models, or dummy variable interactions) may be more appropriate.
+
+    Parameters:
+    - df: DataFrame with all variables
+    - zone: Price zone identifier (e.g., 'SE1')
+    - Y: Dependent variable (price series)
+    - exog_vars: List of exogenous variable names
+    - use_log_transform: If True, uses Wind_Forecast_Log; otherwise Wind_Forecast
+    - plots_dir: Directory to save output plots
+    """
+    print("\n" + "="*80)
+    print(f"TVP KALMAN FILTER ANALYSIS - TIME-VARYING WIND COEFFICIENT ({zone})")
+    print("="*80)
+    print("\nModel: y_t = beta_t * w_t + controls' * gamma + e_t")
+    print("State: beta_t = beta_{t-1} + u_t (random walk)")
+
+    # Create plots directory if it doesn't exist
+    if not os.path.exists(plots_dir):
+        os.makedirs(plots_dir)
+
+    # Step 1: Identify wind column based on mode
+    if use_log_transform:
+        wind_col = 'Wind_Forecast_Log'
+    else:
+        wind_col = 'Wind_Forecast'
+
+    print(f"\nWind variable: {wind_col}")
+
+    # Step 2: Create control columns (exog_vars minus wind)
+    control_cols = [col for col in exog_vars if col != wind_col]
+    print(f"Control variables: {control_cols}")
+
+    # Extract data
+    y = Y.copy()
+    w = df[wind_col].copy()
+    controls = df[control_cols].copy()
+
+    # Align indices and drop any NaN
+    combined = pd.concat([y, w, controls], axis=1).dropna()
+    y = combined.iloc[:, 0]
+    w = combined.iloc[:, 1]
+    controls = combined.iloc[:, 2:]
+
+    print(f"\nObservations after alignment: {len(y)}")
+
+    # Step 3: Frisch-Waugh-Lovell partialling out
+    print("\n--- Frisch-Waugh-Lovell Partialling Out ---")
+    print("Removing control variable effects from both Y and Wind...")
+
+    # Add constant to controls
+    controls_with_const = sm.add_constant(controls)
+
+    # Regress Y on controls and get residuals
+    y_on_controls = sm.OLS(y, controls_with_const).fit()
+    y_star = y_on_controls.resid
+    print(f"  y* = residuals from OLS(Y ~ const + controls), R²={y_on_controls.rsquared:.4f}")
+
+    # Regress wind on controls and get residuals
+    w_on_controls = sm.OLS(w, controls_with_const).fit()
+    w_star = w_on_controls.resid
+    print(f"  w* = residuals from OLS(Wind ~ const + controls), R²={w_on_controls.rsquared:.4f}")
+
+    # Step 4: Define custom TVP state-space model
+    print("\n--- Fitting State-Space Model ---")
+    print("Estimating time-varying wind coefficient via Kalman filter...")
+
+    class TVPWind(sm.tsa.statespace.MLEModel):
+        """
+        Time-varying parameter model for wind coefficient.
+        State equation: beta_t = beta_{t-1} + u_t (random walk)
+        Observation equation: y*_t = beta_t * w*_t + e_t
+        """
+        def __init__(self, y_star, w_star):
+            super().__init__(y_star, k_states=1)
+            # Store w_star for use in design matrix
+            self._w_star = w_star.values.reshape(1, 1, -1)
+            # Design matrix: (1, k_states, nobs) - contains w_star
+            self.ssm['design'] = self._w_star
+            # Transition matrix: [[1.0]] (random walk)
+            self.ssm['transition'] = np.array([[1.0]])
+            # Selection matrix: [[1.0]]
+            self.ssm['selection'] = np.array([[1.0]])
+            # Initialize with approximate diffuse prior
+            self.initialize_approximate_diffuse()
+
+        @property
+        def param_names(self):
+            return ['log_obs_var', 'log_state_var']
+
+        @property
+        def start_params(self):
+            # Starting values: r=1 (log=0), q≈0.14 (log=-2)
+            return np.array([0.0, -2.0])
+
+        def update(self, params, **kwargs):
+            # Observation variance (r)
+            r = np.exp(params[0])
+            # State variance (q)
+            q = np.exp(params[1])
+            self.ssm['obs_cov'] = np.array([[r]])
+            self.ssm['state_cov'] = np.array([[q]])
+
+    # Fit the model
+    tvp_model = TVPWind(y_star, w_star)
+
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore')
+        tvp_results = tvp_model.fit(disp=False)
+
+    # Step 5: Extract results
+    beta_t = tvp_results.smoothed_state[0]
+    se_t = np.sqrt(tvp_results.smoothed_state_cov[0, 0, :])
+    upper_95 = beta_t + 1.96 * se_t
+    lower_95 = beta_t - 1.96 * se_t
+
+    # Get estimated variances
+    r_hat = np.exp(tvp_results.params.iloc[0])  # Observation variance
+    q_hat = np.exp(tvp_results.params.iloc[1])  # State variance
+
+    # Step 6: Print summary statistics
+    print("\n" + "="*80)
+    print("TVP WIND COEFFICIENT - SUMMARY STATISTICS")
+    print("="*80)
+    print(f"\nTime-varying beta_t (wind coefficient):")
+    print(f"  Mean:   {beta_t.mean():.6f}")
+    print(f"  Std:    {beta_t.std():.6f}")
+    print(f"  Min:    {beta_t.min():.6f}")
+    print(f"  Max:    {beta_t.max():.6f}")
+    print(f"  Final:  {beta_t[-1]:.6f}")
+
+    print(f"\nEstimated variances:")
+    print(f"  Observation variance (r): {r_hat:.6f}")
+    print(f"  State variance (q):       {q_hat:.6f}")
+    print(f"  Signal-to-noise ratio:    {q_hat/r_hat:.6f}")
+
+    print(f"\nModel fit:")
+    print(f"  Log-likelihood: {tvp_results.llf:.2f}")
+    print(f"  AIC:            {tvp_results.aic:.2f}")
+    print(f"  BIC:            {tvp_results.bic:.2f}")
+
+    # Step 7: Create and save plot
+    print(f"\n--- Creating TVP Wind Coefficient Plot ---")
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+
+    # Create time index
+    time_index = y.index
+
+    # Plot beta_t with confidence bands
+    ax.plot(time_index, beta_t, color='blue', linewidth=1.5, label=r'$\beta_t$ (Wind coefficient)')
+    ax.fill_between(time_index, lower_95, upper_95, color='blue', alpha=0.2, label='95% CI')
+
+    # Add horizontal line at zero
+    ax.axhline(y=0, color='black', linestyle='--', linewidth=0.8, alpha=0.5)
+
+    # Add horizontal line at mean
+    ax.axhline(y=beta_t.mean(), color='red', linestyle=':', linewidth=1.5,
+               label=f'Mean = {beta_t.mean():.4f}')
+
+    ax.set_title(f'Time-Varying Wind Coefficient - {zone}\n(Kalman Filter State-Space Estimation)',
+                 fontsize=14, fontweight='bold')
+    ax.set_xlabel('Date', fontsize=12)
+    ax.set_ylabel(r'$\beta_t$ (Wind Coefficient)', fontsize=12)
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+
+    # Add annotation with key statistics
+    stats_text = (f'Mean: {beta_t.mean():.4f}\n'
+                  f'Std: {beta_t.std():.4f}\n'
+                  f'Min: {beta_t.min():.4f}\n'
+                  f'Max: {beta_t.max():.4f}')
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+            fontsize=10, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+    plt.tight_layout()
+
+    # Save plot
+    plot_path = os.path.join(plots_dir, f'tvp_beta_wind_{zone}.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"  Saved: {plot_path}")
+    plt.close()
+
+    print("\n" + "="*80)
+    print("TVP KALMAN FILTER ANALYSIS COMPLETE")
+    print("="*80)
+
+    return beta_t, se_t, tvp_results
+
+
 def select_armax_lags_aic(Y, exog_vars, max_p=10, max_q=10):
     """
     Automated lag selection for ARMAX model using AIC minimization.
@@ -639,41 +976,81 @@ def select_armax_lags_aic(Y, exog_vars, max_p=10, max_q=10):
     return best_order
 
 
-def perform_multivariate_analysis(df, zone, use_deseasonalized=False, use_log_transform=False,
+def perform_multivariate_analysis(df, zone, use_log_transform=False, use_deseasonalized=False,
                                  run_ljungbox=False, run_hetero_tests=False, run_stationarity=False,
-                                 optimize_armax_lags=False):
-    """Runs OLS and ARMAX-GARCHX with full control variables and optional diagnostic tests."""
+                                 optimize_armax_lags=False, run_tvp_wind_kalman=False):
+    """
+    Runs OLS and ARMAX-GARCHX with full control variables and optional diagnostic tests.
+
+    Parameters:
+    - use_log_transform: Use logged variables
+    - use_deseasonalized: Use deseasonalized (logged) variables
+    """
     print(f"\n--- RUNNING MULTIVARIATE ANALYSIS ({zone}) ---")
 
-    # Select variables based on log transform toggle
-    if use_log_transform:
-        print("Using: Log-transformed variables (Fredriksson methodology)")
-        # Use logged versions of variables
-        exog_vars = ['Wind_Forecast_Log', 'Hydro_Reserves_Log', 'Net_Exchange', 'Consumption_Log']
-        # Add commodity controls if available
+    # Determine dependent variable (Y) and exogenous variables based on flags
+    if use_log_transform and use_deseasonalized:
+        print("Using: Logged and Deseasonalized variables (Standard approach)")
+
+        # Dependent variable: Price_Log_Deseasonalized
+        Y = df['Price_Log_Deseasonalized']
+
+        # Exogenous variables: deseasonalized logged versions (except Wind and Net_Exchange)
+        exog_vars = [
+            'Wind_Forecast_Log',  # NOT deseasonalized (Fredriksson doesn't deseasonalize wind)
+            'Hydro_Reserves_Log_Deseasonalized',
+            'Net_Exchange',  # NOT logged or deseasonalized
+            'Consumption_Log_Deseasonalized'
+        ]
+
+        # Add commodity controls if available (deseasonalized versions)
+        if 'Oil_Price_Log_Deseasonalized' in df.columns:
+            exog_vars.append('Oil_Price_Log_Deseasonalized')
+        if 'Gas_Price_Log_Deseasonalized' in df.columns:
+            exog_vars.append('Gas_Price_Log_Deseasonalized')
+
+    elif use_log_transform:
+        print("Using: Logged variables only (no deseasonalization)")
+
+        # Dependent variable: Price_Log
+        Y = df['Price_Log']
+
+        # Exogenous variables: logged versions
+        exog_vars = [
+            'Wind_Forecast_Log',
+            'Hydro_Reserves_Log',
+            'Net_Exchange',  # NOT logged
+            'Consumption_Log'
+        ]
+
+        # Add commodity controls if available (logged versions)
         if 'Oil_Price_Log' in df.columns:
             exog_vars.append('Oil_Price_Log')
         if 'Gas_Price_Log' in df.columns:
             exog_vars.append('Gas_Price_Log')
-        Y = df['Price_Log']
+
     else:
-        # Use raw variables
+        print("Using: Raw variables (no log transformation or deseasonalization)")
+
+        # Dependent variable: Price
+        Y = df['Price']
+
+        # Exogenous variables: raw versions
         exog_vars = ['Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']
-        # Add commodity controls if available
+
+        # Add commodity controls if available (raw versions)
         if 'Oil_Price' in df.columns:
             exog_vars.append('Oil_Price')
         if 'Gas_Price' in df.columns:
             exog_vars.append('Gas_Price')
-        if use_deseasonalized:
-            print("Using: Log of Deseasonalized Price")
-            price_shifted = df['Price_Deseasonalized'] + df['Price'].mean()
-            price_shifted = price_shifted.clip(lower=0.01)
-            Y = np.log(price_shifted)
-        else:
-            print("Using: Raw Price")
-            Y = df['Price']
 
+    print(f"Dependent variable: {Y.name}")
     print(f"Exogenous variables: {exog_vars}")
+
+    # TVP Kalman Filter mode: run time-varying parameter analysis and return early
+    if run_tvp_wind_kalman:
+        run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, use_log_transform, plots_dir="plots")
+        return None, None  # Early return, skip OLS/ARMAX
 
     X = sm.add_constant(df[exog_vars])
 
@@ -684,8 +1061,17 @@ def perform_multivariate_analysis(df, zone, use_deseasonalized=False, use_log_tr
 
     # Optional: Diagnostic tests on OLS residuals
     if run_stationarity:
-        # Test stationarity of dependent variable (Price)
-        run_stationarity_tests(Y, series_name=f"{zone} Price (Dependent Variable)")
+        # Test stationarity of ALL variables used in the regression
+        print("\n" + "="*80)
+        print("STATIONARITY TESTS FOR ALL REGRESSION VARIABLES")
+        print("="*80)
+
+        # Test dependent variable (Price)
+        run_stationarity_tests(Y, series_name=f"{zone} {Y.name} (Dependent Variable)")
+
+        # Test all independent variables
+        for var in exog_vars:
+            run_stationarity_tests(df[var], series_name=f"{zone} {var} (Independent Variable)")
 
     if run_ljungbox:
         # Test for autocorrelation in OLS residuals
@@ -1108,6 +1494,18 @@ if __name__ == "__main__":
     # When False: skips visualization and proceeds directly to regression analysis
     RUN_VISUALIZATIONS = False
 
+    # --- TRANSFORMATION TOGGLES (STANDARD APPROACH) ---
+    # Toggle for logarithmic transformation (Fredriksson 2016 methodology)
+    # When True: applies log() to Price, Wind_Forecast, Hydro_Reserves, Consumption, Oil_Price, Gas_Price
+    # Net_Exchange is NOT logged (can contain negative values)
+    # STANDARD APPROACH: Log transformation is applied FIRST, before deseasonalization
+    USE_LOG_TRANSFORM = True
+
+    # Toggle for deseasonalization (Fredriksson 2016 methodology)
+    # When True: deseasonalizes the LOGGED variables using dummy variable regression
+    # STANDARD APPROACH: Deseasonalization is applied to LOGGED series (after log transformation)
+    USE_DESEASONALIZED = True
+
     # --- OUTLIER HANDLING TOGGLE ---
     # Toggle for outlier replacement using Fredriksson (2016) methodology
     # When True: replaces outliers with mean of 24 and 48 hours before/after
@@ -1118,9 +1516,10 @@ if __name__ == "__main__":
     #   1st: On original price series (found 31 outliers)
     #   2nd: On deseasonalized price series (found 42 outliers)
     #
-    # OUR APPROACH: Apply outlier filter ONCE, AFTER deseasonalization
+    # OUR APPROACH: Apply outlier filter ONCE, on logged-deseasonalized series
     # Rationale:
     #   - Seasonal patterns mask true outliers (e.g., high winter prices vs low summer)
+    #   - Log transformation stabilizes variance
     #   - Deseasonalized mean ≈ 0 makes 6σ threshold more meaningful
     #   - Cleaner single-pass approach with stronger statistical justification
     #   - Fredriksson provides no theoretical justification for double application
@@ -1128,33 +1527,30 @@ if __name__ == "__main__":
     # TODO: Future sensitivity analysis could compare single vs. double application
     HANDLE_OUTLIERS = True
 
-    # Toggle for Fredriksson-style deseasonalization + log transformation
-    # Set to True to use deseasonalized log price, False for raw price
-    USE_DESEASONALIZED = True
-
-    # Toggle for logarithmic transformation (Fredriksson 2016 methodology)
-    # When True: applies log() to Price, Wind_Forecast, Hydro_Reserves, Consumption
-    # Net_Exchange is NOT logged (can contain negative values)
-    USE_LOG_TRANSFORM = True
-
     # Toggle for linear interpolation of missing values
     # When True: fills missing values by linear interpolation between surrounding values
     # When False: drops all rows with missing values (original behavior)
     USE_LINEAR_INTERPOLATION = True
 
+    # --- COMMODITY PRICE LAGGING ---
+    # Commodity prices (oil & gas) are ALWAYS lagged by 24 hours (hardcoded in pipeline)
+    # Rationale: Day-ahead electricity market uses commodity prices from bidding time (D-1)
+    # This aligns with standard literature (Weron, Huisman, etc.)
+    LAG_COMMODITY_HOURS = 24  # Applied automatically in lag_commodity_prices()
+
     # --- DIAGNOSTIC TEST TOGGLES (Fredriksson 2016 methodology) ---
     # Toggle for Ljung-Box test for autocorrelation
     # Tests whether residuals exhibit autocorrelation at various lag lengths
-    RUN_LJUNGBOX_TEST = False
+    RUN_LJUNGBOX_TEST = True
 
     # Toggle for heteroskedasticity and ARCH effects tests
     # Includes Engle's ARCH test and Ljung-Box Q test on squared residuals
     # If ARCH effects detected, consider implementing GARCHX model
-    RUN_HETEROSKEDASTICITY_TESTS = False
+    RUN_HETEROSKEDASTICITY_TESTS = True
 
     # Toggle for stationarity tests (ADF and DF-GLS)
     # Tests whether price series has a unit root (non-stationary)
-    RUN_STATIONARITY_TESTS = False
+    RUN_STATIONARITY_TESTS = True
 
     # --- MODEL SPECIFICATION TOGGLES ---
     # Toggle for automated ARMAX lag selection via AIC minimization
@@ -1162,6 +1558,11 @@ if __name__ == "__main__":
     # When False: Uses default ARMAX(3,3) specification
     # WARNING: This can take several minutes to run (tests 100 model combinations)
     OPTIMIZE_ARMAX_LAGS = False
+
+    # --- TVP KALMAN FILTER TOGGLE ---
+    # When True: estimates time-varying wind coefficient using state-space model
+    # When False: runs standard OLS + ARMAX analysis
+    RUN_TVP_WIND_KALMAN = True
 
     # Updated paths matching your local project directory
     # Master data files are stored in 'master data files/' folder
@@ -1179,38 +1580,52 @@ if __name__ == "__main__":
         data = load_all_thesis_data(PATHS, zone_price=ACTIVE_ZONE, use_interpolation=USE_LINEAR_INTERPOLATION)
         print(f"Merge successful. Total hourly observations: {len(data)}")
 
+        # --- STEP 0: LAG COMMODITY PRICES (day-ahead market alignment) ---
+        # Apply 24-hour lag to oil and gas prices to reflect information set at bidding time
+        # Standard practice in electricity price modeling: commodity prices at time t should be
+        # from t-24 (when day-ahead auction occurred), not from time t (delivery time)
+        data = lag_commodity_prices(data, lag_hours=LAG_COMMODITY_HOURS)
+
         # --- STEP 1: VISUALIZATION OF RAW DATA (if enabled) ---
         if RUN_VISUALIZATIONS:
             run_visualizations(data, ACTIVE_ZONE)
 
-        # --- STEP 2: DESEASONALIZATION (if enabled) ---
-        # Deseasonalize BEFORE outlier handling (if both are enabled)
-        # This allows outlier detection on deseasonalized data for more meaningful thresholds
-        if USE_DESEASONALIZED:
-            data = deseasonalize_price(data)
-
-        # --- STEP 3: OUTLIER HANDLING (if enabled) ---
-        # Can handle outliers on either:
-        #   - Raw Price (if USE_DESEASONALIZED=False)
-        #   - Deseasonalized Price (if USE_DESEASONALIZED=True) ← RECOMMENDED
-        # Our approach differs from Fredriksson who applies outlier filter twice
-        if HANDLE_OUTLIERS:
-            data, outlier_stats = handle_outliers_fredriksson(data, use_deseasonalized=USE_DESEASONALIZED)
-
-        # --- STEP 4: LOG TRANSFORMATION (if enabled) ---
-        # Apply logarithmic transformation (Fredriksson 2016 methodology)
+        # --- STEP 2: LOG TRANSFORMATION (if enabled) ---
+        # STANDARD APPROACH: Apply log transformation FIRST, before deseasonalization
+        # This is the standard econometric approach for handling multiplicative seasonality
+        # Note: Commodity prices are already lagged at this point
         if USE_LOG_TRANSFORM:
-            data = apply_log_transform(data, use_deseasonalized=USE_DESEASONALIZED)
+            data = apply_log_transform(data)
+
+        # --- STEP 3: DESEASONALIZATION (if enabled) ---
+        # STANDARD APPROACH: Deseasonalize the LOGGED variables (after log transformation)
+        # Price & Consumption: Year + Month + DOW + Hour + Holiday (FULL deseasonalization)
+        # Hydro, Oil, Gas: Year + Month ONLY (PARTIAL - no intraday patterns)
+        if USE_DESEASONALIZED:
+            data = deseasonalize_logged_variables(data)
+
+        # --- STEP 4: OUTLIER HANDLING (if enabled) ---
+        # Apply outlier handling to logged-deseasonalized series (if both transformations enabled)
+        # This provides the most meaningful outlier detection:
+        #   - Log transformation stabilizes variance
+        #   - Deseasonalization removes seasonal patterns
+        #   - 6σ threshold more meaningful on transformed data
+        if HANDLE_OUTLIERS:
+            data, outlier_stats = handle_outliers_fredriksson(data,
+                                                              use_log_transform=USE_LOG_TRANSFORM,
+                                                              use_deseasonalized=USE_DESEASONALIZED)
 
         # --- STEP 5: REGRESSION ANALYSIS ---
         # Run regression models with optional diagnostic tests
+        # Commodity prices used in regression are lagged by 24h (from Step 0)
         perform_multivariate_analysis(data, ACTIVE_ZONE,
-                                      use_deseasonalized=USE_DESEASONALIZED,
                                       use_log_transform=USE_LOG_TRANSFORM,
+                                      use_deseasonalized=USE_DESEASONALIZED,
                                       run_ljungbox=RUN_LJUNGBOX_TEST,
                                       run_hetero_tests=RUN_HETEROSKEDASTICITY_TESTS,
                                       run_stationarity=RUN_STATIONARITY_TESTS,
-                                      optimize_armax_lags=OPTIMIZE_ARMAX_LAGS)
+                                      optimize_armax_lags=OPTIMIZE_ARMAX_LAGS,
+                                      run_tvp_wind_kalman=RUN_TVP_WIND_KALMAN)
 
     except Exception as e:
         print(f"Critical error during execution: {e}")
