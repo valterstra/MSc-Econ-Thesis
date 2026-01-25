@@ -5,10 +5,11 @@ import pytz
 
 # --- 1. Configuration ---
 folder_path = 'data/consumption_forecast'
-years_to_include = ['2021', '2022', '2023', '2024']
-output_filename = 'Master_Consumption_2021_2024.xlsx'
+years_to_include = ['2015', '2016', '2017', '2018', '2019', '2020', '2021', '2022', '2023', '2024', '2025']
+output_filename = 'Master_Consumption_2015_2025.xlsx'
 
-# Comprehensive list of all TSOs and Bidding Zones found in images
+# Comprehensive list of all TSOs and Bidding Zones
+# Note: NO and NO1-NO5 both included - files will have one or the other depending on time period
 target_regions = [
     '50Hz', 'AMP', 'TBW', 'TTG',
     'DK1', 'DK2', 'FI', 'NO',
@@ -16,10 +17,10 @@ target_regions = [
     'SE1', 'SE2', 'SE3', 'SE4', 'DE'
 ]
 
-# --- 2. Create the Ground Truth (35,064 rows) ---
-# Handles CET/CEST transitions (23h/25h) for a perfect 4-year baseline
+# --- 2. Create the Ground Truth ---
+# Handles CET/CEST transitions (23h/25h)
 tz = pytz.timezone('Europe/Stockholm')
-gt_range = pd.date_range(start='2021-01-01 00:00:00', end='2024-12-31 23:00:00', freq='h', tz=tz)
+gt_range = pd.date_range(start='2015-01-01 00:00:00', end='2025-12-31 23:00:00', freq='h', tz=tz)
 
 ground_truth_df = pd.DataFrame({'Timestamp': gt_range.tz_localize(None)})
 ground_truth_df['Occurrence'] = ground_truth_df.groupby('Timestamp').cumcount()
@@ -42,6 +43,25 @@ else:
 
     files = sorted(unique_map.values())
     print(f"--- Extracting {len(target_regions)} zones from {len(files)} files ---")
+
+    # --- Check for Missing Days ---
+    expected_dates = pd.date_range(start='2015-01-01', end='2025-12-31', freq='D')
+    expected_date_strs = set(expected_dates.strftime('%Y-%m-%d'))
+
+    actual_date_strs = set()
+    for file in files:
+        match = re.search(r'(\d{4}-\d{2}-\d{2})', file)
+        if match:
+            actual_date_strs.add(match.group(0))
+
+    missing_dates = sorted(expected_date_strs - actual_date_strs)
+    if missing_dates:
+        print(f"\n⚠️ MISSING FILES: {len(missing_dates)} days have no file in the folder:")
+        for date in missing_dates:
+            print(f"  {date}")
+        print()
+    else:
+        print("✅ All expected day files are present in the folder.\n")
 
     for file in files:
         path = os.path.join(folder_path, file)
@@ -88,7 +108,7 @@ else:
 if all_days_data:
     merged_data = pd.concat(all_days_data, ignore_index=True)
 
-    # Perform the outer join to the 35,064-row skeleton
+    # Perform the outer join to the ground truth skeleton
     final_df = pd.merge(ground_truth_df, merged_data, on=['Timestamp', 'Occurrence'],
                         how='left', indicator=True)
 
@@ -103,8 +123,8 @@ if all_days_data:
 
     if not gaps.empty:
         print(f"⚠️ Alert: {len(gaps)} hours are missing data.")
-        print("First few gaps:")
-        print(gaps['Timestamp'].head(5))
+        print("\nMissing hours:")
+        print(gaps[['Timestamp']].to_string(index=False))
     else:
         print("✅ Perfect match with ground truth.")
 

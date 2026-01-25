@@ -5,21 +5,21 @@ import pytz
 
 # --- 1. Configuration ---
 folder_path = 'data/production_forecast_s4'
-years_to_include = ['2021', '2022', '2023', '2024']
-output_filename = 'Verified_S4_Wind_Forecast_2021_2024.xlsx'
+years_to_include = ['2015', '2016', '2017', '2018', '2019', '2020', '2021', '2022', '2023', '2024', '2025']
+output_filename = 'Verified_S4_Wind_Forecast_2015_2025.xlsx'
 
-# --- 2. Create the Ground Truth (35,064 rows) ---
+# --- 2. Create the Ground Truth (96,360 rows) ---
 tz = pytz.timezone('Europe/Stockholm')
-gt_range = pd.date_range(start='2021-01-01 00:00:00', end='2024-12-31 23:00:00', freq='h', tz=tz)
+gt_range = pd.date_range(start='2015-01-01 00:00:00', end='2025-12-31 23:00:00', freq='h', tz=tz)
 
 ground_truth_df = pd.DataFrame({'Timestamp': gt_range.tz_localize(None)})
 # Sequential ID for duplicate hours in October
 ground_truth_df['Occurrence'] = ground_truth_df.groupby('Timestamp').cumcount()
 
-# --- 3. Process S1 Files ---
+# --- 3. Process S4 Files ---
 all_days_data = []
 
-# Filter files for 2021-2024 and remove duplicates like (1).xlsx
+# Filter files for 2015-2025 and remove duplicates like (1).xlsx
 raw_files = [f for f in os.listdir(folder_path) if f.endswith('.xlsx')]
 unique_map = {}
 for f in raw_files:
@@ -30,7 +30,26 @@ for f in raw_files:
             unique_map[date_key] = f
 
 files = sorted(unique_map.values())
-print(f"Processing {len(files)} files for S1...")
+print(f"Processing {len(files)} files for S4...")
+
+# --- Check for Missing Days ---
+expected_dates = pd.date_range(start='2015-01-01', end='2025-12-31', freq='D')
+expected_date_strs = set(expected_dates.strftime('%Y-%m-%d'))
+
+actual_date_strs = set()
+for file in files:
+    match = re.search(r'(\d{4}-\d{2}-\d{2})', file)
+    if match:
+        actual_date_strs.add(match.group(0))
+
+missing_dates = sorted(expected_date_strs - actual_date_strs)
+if missing_dates:
+    print(f"\n⚠️ MISSING FILES: {len(missing_dates)} days have no file in the folder:")
+    for date in missing_dates:
+        print(f"  {date}")
+    print()
+else:
+    print("✅ All expected day files are present in the folder.\n")
 
 for file in files:
     path = os.path.join(folder_path, file)
@@ -53,7 +72,7 @@ for file in files:
         df_raw = pd.read_excel(path, header=None, skiprows=5, nrows=30, usecols=[0, target_col], decimal=',')
         # Filter for rows with time periods like "00:00 - 01:00"
         df = df_raw[df_raw[0].astype(str).str.contains(' - ')].copy()
-        df.columns = ['Period', 'S1_Wind']
+        df.columns = ['Period', 'S4_Wind']
 
         # Construct Timestamp
         date_str = re.search(r'\d{4}-\d{2}-\d{2}', file).group(0)
@@ -62,18 +81,18 @@ for file in files:
         # Add Occurrence to handle October duplicates
         df['Occurrence'] = df.groupby('Timestamp').cumcount()
 
-        all_days_data.append(df[['Timestamp', 'Occurrence', 'S1_Wind']])
+        all_days_data.append(df[['Timestamp', 'Occurrence', 'S4_Wind']])
 
     except Exception as e:
         print(f"Error reading {file}: {e}")
 
 # --- 4. Merge and Audit ---
-merged_s1 = pd.concat(all_days_data, ignore_index=True)
+merged_s4 = pd.concat(all_days_data, ignore_index=True)
 
-# Force S1 data into the 35,064-row Ground Truth
+# Force S4 data into the Ground Truth
 final_df = pd.merge(
     ground_truth_df,
-    merged_s1,
+    merged_s4,
     on=['Timestamp', 'Occurrence'],
     how='left',
     indicator=True
@@ -87,8 +106,10 @@ print(f"Actual Count: {len(final_df)}")
 
 if not gaps.empty:
     print(f"⚠️ MISSING DATA: {len(gaps)} hours are empty (missing files or columns).")
+    print("\nMissing hours:")
+    print(gaps[['Timestamp']].to_string(index=False))
 else:
-    print("✅ PERFECT ALIGNMENT: All 35,064 hours are present in the structure.")
+    print(f"✅ PERFECT ALIGNMENT: All {len(ground_truth_df)} hours are present in the structure.")
 
 # Save final result
 final_df.drop(columns=['Occurrence', '_merge']).to_excel(output_filename, index=False)

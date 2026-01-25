@@ -1264,6 +1264,295 @@ def run_rolling_window_analysis(df, zone, Y, exog_vars, use_log_transform,
     print("="*80)
 
 
+def run_quantile_regression_analysis(df, zone, use_log_transform,
+                                     plots_dir="plots", results_dir="results"):
+    """
+    Estimate wind coefficient across quantiles of the price distribution.
+
+    Uses raw/log variables (NOT deseasonalized) with calendar dummies included directly
+    in the regression to control for seasonality (FULL basis: Year+Month+DOW+Hour+Holiday).
+
+    Parameters:
+    - df: DataFrame with all variables
+    - zone: Price zone identifier
+    - use_log_transform: Whether log transformation was applied
+    - plots_dir: Directory for saving plots
+    - results_dir: Directory for saving CSV results
+
+    Returns: None (saves outputs to files)
+    """
+    # Hardcoded quantiles and seasonality settings (not user-configurable)
+    QUANTILES = [0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
+
+    print("\n" + "="*80)
+    print("QUANTILE REGRESSION ANALYSIS")
+    print("="*80)
+
+    # --- Step 1: Determine dependent variable (raw/log, NOT deseasonalized) ---
+    if use_log_transform and 'Price_Log' in df.columns:
+        y_col = 'Price_Log'
+    else:
+        y_col = 'Price'
+
+    print(f"\nDependent variable: {y_col}")
+    print("  (Using raw/log price, NOT deseasonalized - seasonality handled via dummies)")
+
+    # --- Step 2: Determine economic regressors (raw/log, NOT deseasonalized) ---
+    econ_vars = []
+
+    # Wind (required)
+    if use_log_transform and 'Wind_Forecast_Log' in df.columns:
+        wind_col = 'Wind_Forecast_Log'
+    else:
+        wind_col = 'Wind_Forecast'
+    econ_vars.append(wind_col)
+
+    # Consumption/Demand (required)
+    if use_log_transform and 'Consumption_Log' in df.columns:
+        demand_col = 'Consumption_Log'
+    else:
+        demand_col = 'Consumption'
+    econ_vars.append(demand_col)
+
+    # Hydro reserves (required)
+    if use_log_transform and 'Hydro_Reserves_Log' in df.columns:
+        hydro_col = 'Hydro_Reserves_Log'
+    else:
+        hydro_col = 'Hydro_Reserves'
+    econ_vars.append(hydro_col)
+
+    # Net exchange (optional)
+    if 'Net_Exchange' in df.columns:
+        econ_vars.append('Net_Exchange')
+    else:
+        print("  Note: 'Net_Exchange' not found, skipping")
+
+    # Oil price (optional)
+    oil_col = None
+    if use_log_transform and 'Oil_Price_Log' in df.columns:
+        oil_col = 'Oil_Price_Log'
+        econ_vars.append(oil_col)
+    elif 'Oil_Price' in df.columns:
+        oil_col = 'Oil_Price'
+        econ_vars.append(oil_col)
+    else:
+        print("  Note: Oil price not found, skipping")
+
+    # Gas price (optional)
+    gas_col = None
+    if use_log_transform and 'Gas_Price_Log' in df.columns:
+        gas_col = 'Gas_Price_Log'
+        econ_vars.append(gas_col)
+    elif 'Gas_Price' in df.columns:
+        gas_col = 'Gas_Price'
+        econ_vars.append(gas_col)
+    else:
+        print("  Note: Gas price not found, skipping")
+
+    print(f"\nEconomic regressors: {econ_vars}")
+
+    # --- Step 3: Build calendar/seasonal dummies (FULL basis) ---
+    print("\nBuilding seasonality controls (FULL basis: Year+Month+DOW+Hour+Holiday)...")
+
+    # Create a working copy to avoid modifying original
+    tmp = df.copy()
+
+    # Extract time components from datetime index
+    tmp['Year'] = tmp.index.year
+    tmp['Month'] = tmp.index.month
+    tmp['DayOfWeek'] = tmp.index.dayofweek  # 0=Monday, 6=Sunday
+    tmp['Hour'] = tmp.index.hour
+
+    # Create holiday indicator for Swedish holidays
+    try:
+        import holidays
+        swedish_holidays = holidays.Sweden(years=range(tmp.index.year.min(), tmp.index.year.max() + 1))
+        tmp['Holiday'] = tmp.index.to_series().apply(lambda x: 1 if x.date() in swedish_holidays else 0).values
+        print("  Holiday dummies created using Swedish holiday calendar")
+    except ImportError:
+        tmp['Holiday'] = 0
+        print("  WARNING: 'holidays' package not installed; Holiday set to 0 (no crash)")
+
+    # Create dummy variables with drop_first=True to avoid multicollinearity
+    year_dummies = pd.get_dummies(tmp['Year'], prefix='Year', drop_first=True)
+    month_dummies = pd.get_dummies(tmp['Month'], prefix='Month', drop_first=True)
+    dow_dummies = pd.get_dummies(tmp['DayOfWeek'], prefix='DOW', drop_first=True)
+    hour_dummies = pd.get_dummies(tmp['Hour'], prefix='Hour', drop_first=True)
+
+    print(f"  Year dummies: {len(year_dummies.columns)} columns")
+    print(f"  Month dummies: {len(month_dummies.columns)} columns")
+    print(f"  DOW dummies: {len(dow_dummies.columns)} columns")
+    print(f"  Hour dummies: {len(hour_dummies.columns)} columns")
+    print(f"  Holiday: 1 column (binary indicator)")
+
+    # --- Step 4: Assemble data matrix ---
+    # Combine all regressors
+    cols_needed = [y_col] + econ_vars
+    data_subset = tmp[cols_needed].copy()
+
+    # Add seasonal dummies
+    data_subset = pd.concat([data_subset, year_dummies, month_dummies, dow_dummies, hour_dummies], axis=1)
+    data_subset['Holiday'] = tmp['Holiday'].values
+
+    # Drop rows with NA and sort by index
+    data_subset = data_subset.dropna()
+    data_subset = data_subset.sort_index()
+
+    print(f"\nData range: {data_subset.index.min()} to {data_subset.index.max()}")
+    print(f"Observations after cleaning: {len(data_subset):,}")
+
+    # Build y and X
+    y = data_subset[y_col].astype(float)
+
+    # X includes: constant + economic vars + seasonal dummies + holiday
+    seasonal_cols = list(year_dummies.columns) + list(month_dummies.columns) + \
+                    list(dow_dummies.columns) + list(hour_dummies.columns) + ['Holiday']
+    X_cols = econ_vars + seasonal_cols
+
+    # Ensure all columns are numeric (convert to float64)
+    X_data = data_subset[X_cols].astype(float)
+    X = sm.add_constant(X_data)
+
+    print(f"\nTotal regressors (incl. const): {X.shape[1]}")
+    print(f"  Economic controls: {len(econ_vars)}")
+    print(f"  Seasonal controls: {len(seasonal_cols)}")
+
+    # --- Step 5: Run quantile regressions ---
+    print(f"\n--- Estimating Quantile Regressions ---")
+    print(f"Quantiles: {QUANTILES}")
+    # TODO: Block bootstrap can be added later for time-series-robust inference
+
+    results = []
+    for q in QUANTILES:
+        print(f"  Estimating q={q:.2f}...", end='')
+
+        model = sm.QuantReg(y, X)
+        res = model.fit(q=q)
+
+        # Extract coefficients for key variables
+        result_row = {
+            'quantile': q,
+            'beta_wind': res.params[wind_col],
+            'se_wind': res.bse[wind_col] if wind_col in res.bse.index else np.nan,
+            'p_wind': res.pvalues[wind_col] if wind_col in res.pvalues.index else np.nan,
+            'beta_demand': res.params[demand_col],
+            'se_demand': res.bse[demand_col] if demand_col in res.bse.index else np.nan,
+            'p_demand': res.pvalues[demand_col] if demand_col in res.pvalues.index else np.nan,
+            'beta_hydro': res.params[hydro_col],
+            'se_hydro': res.bse[hydro_col] if hydro_col in res.bse.index else np.nan,
+            'p_hydro': res.pvalues[hydro_col] if hydro_col in res.pvalues.index else np.nan,
+            'n_obs': int(res.nobs)
+        }
+
+        # Add oil/gas if available
+        if oil_col and oil_col in res.params.index:
+            result_row['beta_oil'] = res.params[oil_col]
+            result_row['se_oil'] = res.bse[oil_col] if oil_col in res.bse.index else np.nan
+            result_row['p_oil'] = res.pvalues[oil_col] if oil_col in res.pvalues.index else np.nan
+
+        if gas_col and gas_col in res.params.index:
+            result_row['beta_gas'] = res.params[gas_col]
+            result_row['se_gas'] = res.bse[gas_col] if gas_col in res.bse.index else np.nan
+            result_row['p_gas'] = res.pvalues[gas_col] if gas_col in res.pvalues.index else np.nan
+
+        results.append(result_row)
+        print(f" beta_wind={result_row['beta_wind']:.6f}, p={result_row['p_wind']:.4f}")
+
+    # Create results DataFrame
+    results_df = pd.DataFrame(results)
+
+    # --- Step 6: Print summary ---
+    print("\n" + "="*80)
+    print("QUANTILE REGRESSION RESULTS SUMMARY")
+    print("="*80)
+    print(f"\nDependent variable: {y_col}")
+    print(f"Seasonality basis: FULL (Year+Month+DOW+Hour+Holiday)")
+    print(f"Observations: {results_df['n_obs'].iloc[0]:,}")
+
+    print(f"\nWind coefficient by quantile:")
+    print(f"{'Quantile':<10} {'Beta':<12} {'SE':<12} {'p-value':<10}")
+    print("-" * 44)
+    for _, row in results_df.iterrows():
+        sig = "***" if row['p_wind'] < 0.01 else "**" if row['p_wind'] < 0.05 else "*" if row['p_wind'] < 0.1 else ""
+        print(f"{row['quantile']:<10.2f} {row['beta_wind']:<12.6f} {row['se_wind']:<12.6f} {row['p_wind']:<10.4f} {sig}")
+
+    print(f"\nDemand coefficient by quantile:")
+    print(f"{'Quantile':<10} {'Beta':<12} {'SE':<12} {'p-value':<10}")
+    print("-" * 44)
+    for _, row in results_df.iterrows():
+        sig = "***" if row['p_demand'] < 0.01 else "**" if row['p_demand'] < 0.05 else "*" if row['p_demand'] < 0.1 else ""
+        print(f"{row['quantile']:<10.2f} {row['beta_demand']:<12.6f} {row['se_demand']:<12.6f} {row['p_demand']:<10.4f} {sig}")
+
+    # --- Step 7: Save CSV output ---
+    os.makedirs(results_dir, exist_ok=True)
+    csv_path = os.path.join(results_dir, f'quantreg_{zone}.csv')
+    results_df.to_csv(csv_path, index=False)
+    print(f"\nSaved results to: {csv_path}")
+
+    # --- Step 8: Create plots ---
+    os.makedirs(plots_dir, exist_ok=True)
+
+    # Plot 1: Wind coefficient across quantiles
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    quantiles = results_df['quantile'].values
+    beta_wind = results_df['beta_wind'].values
+    se_wind = results_df['se_wind'].values
+
+    # 95% CI
+    upper_95 = beta_wind + 1.96 * se_wind
+    lower_95 = beta_wind - 1.96 * se_wind
+
+    ax.plot(quantiles, beta_wind, 'o-', linewidth=2, markersize=8, label=r'$\beta_{wind}$')
+    ax.fill_between(quantiles, lower_95, upper_95, alpha=0.2, label='95% CI')
+    ax.axhline(y=0, color='black', linestyle='--', linewidth=0.8, alpha=0.5)
+
+    ax.set_xlabel('Quantile', fontsize=12)
+    ax.set_ylabel(r'$\beta_{wind}$ (Wind Coefficient)', fontsize=12)
+    ax.set_title(f'Quantile Regression: Wind Coefficient - {zone}\n(FULL seasonality: Year+Month+DOW+Hour+Holiday)',
+                 fontsize=14, fontweight='bold')
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_xticks(quantiles)
+
+    plt.tight_layout()
+    plot_path = os.path.join(plots_dir, f'quantreg_beta_wind_{zone}.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"Saved plot: {plot_path}")
+    plt.close()
+
+    # Plot 2: Demand coefficient across quantiles
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    beta_demand = results_df['beta_demand'].values
+    se_demand = results_df['se_demand'].values
+
+    upper_95 = beta_demand + 1.96 * se_demand
+    lower_95 = beta_demand - 1.96 * se_demand
+
+    ax.plot(quantiles, beta_demand, 'o-', linewidth=2, markersize=8, label=r'$\beta_{demand}$')
+    ax.fill_between(quantiles, lower_95, upper_95, alpha=0.2, label='95% CI')
+    ax.axhline(y=0, color='black', linestyle='--', linewidth=0.8, alpha=0.5)
+
+    ax.set_xlabel('Quantile', fontsize=12)
+    ax.set_ylabel(r'$\beta_{demand}$ (Demand Coefficient)', fontsize=12)
+    ax.set_title(f'Quantile Regression: Demand Coefficient - {zone}\n(FULL seasonality: Year+Month+DOW+Hour+Holiday)',
+                 fontsize=14, fontweight='bold')
+    ax.legend(loc='best')
+    ax.grid(True, alpha=0.3)
+    ax.set_xticks(quantiles)
+
+    plt.tight_layout()
+    plot_path = os.path.join(plots_dir, f'quantreg_beta_demand_{zone}.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"Saved plot: {plot_path}")
+    plt.close()
+
+    print("\n" + "="*80)
+    print("QUANTILE REGRESSION ANALYSIS COMPLETE")
+    print("="*80)
+
+
 def select_armax_lags_aic(Y, exog_vars, max_p=10, max_q=10):
     """
     Automated lag selection for ARMAX model using AIC minimization.
@@ -1332,7 +1621,8 @@ def perform_multivariate_analysis(df, zone, use_log_transform=False, use_deseaso
                                  run_ljungbox=False, run_hetero_tests=False, run_stationarity=False,
                                  optimize_armax_lags=False, run_tvp_wind_kalman=False,
                                  run_rolling_window=False, rolling_window_years=3,
-                                 rolling_step_years=1, rolling_min_obs=24*180):
+                                 rolling_step_years=1, rolling_min_obs=24*180,
+                                 run_quantile_regression=False):
     """
     Runs OLS and ARMAX-GARCHX with full control variables and optional diagnostic tests.
 
@@ -1414,6 +1704,13 @@ def perform_multivariate_analysis(df, zone, use_log_transform=False, use_deseaso
                                     min_obs=rolling_min_obs,
                                     plots_dir="plots",
                                     results_dir="results")
+        return None, None  # Early return, skip OLS/ARMAX
+
+    # Quantile regression mode: run quantile regression analysis and return early
+    if run_quantile_regression:
+        run_quantile_regression_analysis(df, zone, use_log_transform,
+                                         plots_dir="plots",
+                                         results_dir="results")
         return None, None  # Early return, skip OLS/ARMAX
 
     X = sm.add_constant(df[exog_vars])
@@ -1883,7 +2180,7 @@ if __name__ == "__main__":
     # 'gianfreda': Gianfreda (2010) / Mugele et al. (2005) methodology
     #   - Threshold: ±3σ (symmetric)
     #   - Replacement: Capped at ±3σ for respective weekday
-    OUTLIER_METHOD = 'fredriksson'  # Options: 'fredriksson' or 'gianfreda'
+    OUTLIER_METHOD = 'gianfreda'  # Options: 'fredriksson' or 'gianfreda'
 
     # METHODOLOGICAL NOTE:
     # Fredriksson (2016) applies outlier filter TWICE:
@@ -1940,12 +2237,17 @@ if __name__ == "__main__":
     # --- ROLLING-WINDOW ESTIMATION TOGGLE ---
     # When True: estimates wind coefficient using overlapping rolling windows (skips OLS/ARMAX)
     # When False: runs standard full-sample analysis
-    RUN_ROLLING_WINDOW = True
+    RUN_ROLLING_WINDOW = False
 
     # Rolling window configuration
     ROLLING_WINDOW_YEARS = 1          # Window size in years
     ROLLING_STEP_YEARS = 1            # Step size between windows in years
     ROLLING_MIN_OBS = 24 * 180        # Minimum observations per window (6 months hourly data)
+
+    # --- QUANTILE REGRESSION TOGGLE ---
+    # When True: estimates wind coefficient across quantiles of price distribution (skips OLS/ARMAX)
+    # When False: runs standard analysis
+    RUN_QUANTILE_REGRESSION = False
 
     # Updated paths matching your local project directory
     # Master data files are stored in 'master data files/' folder
@@ -2019,7 +2321,8 @@ if __name__ == "__main__":
                                       run_rolling_window=RUN_ROLLING_WINDOW,
                                       rolling_window_years=ROLLING_WINDOW_YEARS,
                                       rolling_step_years=ROLLING_STEP_YEARS,
-                                      rolling_min_obs=ROLLING_MIN_OBS)
+                                      rolling_min_obs=ROLLING_MIN_OBS,
+                                      run_quantile_regression=RUN_QUANTILE_REGRESSION)
 
     except Exception as e:
         print(f"Critical error during execution: {e}")
