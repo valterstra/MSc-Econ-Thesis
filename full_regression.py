@@ -11,135 +11,206 @@ matplotlib.use('Agg')  # Use non-interactive backend (save plots only, no displa
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import gaussian_kde
+import holidays
+
+# Progress tracking
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    print("Note: Install 'tqdm' for enhanced progress bars (pip install tqdm)")
+
+# Trading partners for congestion dummies (must match regional_data_combiner.py)
+TRADING_PARTNERS = {
+    'SE1': ['FI', 'NO4', 'SE2'],
+    'SE2': ['NO3', 'NO4', 'SE1', 'SE3'],
+    'SE3': ['DK1', 'FI', 'NO1', 'SE2', 'SE4'],
+    'SE4': []   # To be defined
+}
 
 # --- 1. DATA LOADING FUNCTIONS ---
 
-def load_commodities(path):
+
+def load_data(paths, target_region='SE1', zone_hydro='SE1', use_interpolation=False,
+                                 start_date=None, end_date=None, lag_commodity_hours=24):
     """
-    Load commodity prices (Brent crude oil and TTF natural gas) from Bloomberg export file.
+    Load pre-combined regional data file and merge with hydro reserves and commodities.
 
-    The Master_Commodities.xlsx file has Bloomberg-style headers:
-    - Rows 0-5: Header metadata (skip)
-    - Row 6+: Data with columns: Date, TTF_Gas, WTI_Oil, Brent_Oil, MT1, LUA1, CP1
+    This function loads the Combined_{region}_Data file which already contains:
+    - Timestamp, Spot_Price, Wind_Forecast, Net_Exchange, Consumption_Forecast
+    - Bottleneck dummies (BNECK_{region}_{partner})
 
-    Returns DataFrame with columns: Date, Oil_Price (Brent), Gas_Price (TTF)
-    Daily frequency - will be merged with hourly data by date.
+    It then separately merges:
+    - Hydro reserves from Master_Hydro_Reservoir.xlsx
+    - Commodity prices (Oil, Gas) from Master_Commodities.xlsx
+    - Automatically lags commodity prices to align with day-ahead market timing
+
+    Parameters:
+    - paths: dict with keys 'combined', 'hydro', 'commodities'
+    - target_region: Target region for analysis (default 'SE1')
+    - zone_hydro: Zone for hydro reserves (default 'SE1')
+    - use_interpolation: If True, interpolate missing values; if False, drop rows with NaN
+    - start_date: Optional start date filter (e.g., '2021-01-01')
+    - end_date: Optional end date filter (e.g., '2024-12-31')
+    - lag_commodity_hours: Hours to lag commodity prices (default 24 for day-ahead market)
+
+    Returns:
+    - DataFrame indexed by Datetime with columns:
+      Price, Wind_Forecast, Hydro_Reserves, Net_Exchange, Consumption, Oil_Price, Gas_Price,
+      plus bottleneck dummies (BNECK_{region}_{partner})
+      Note: Oil_Price and Gas_Price are automatically lagged by lag_commodity_hours
     """
-    print("\n--- LOADING COMMODITY PRICES (Brent Oil & TTF Gas) ---")
+    print("\n--- LOADING COMBINED REGIONAL DATA ---")
 
-    # Read with proper header skipping (Bloomberg format)
-    df = pd.read_excel(path, header=None, skiprows=5)
+    # Step 1: Load combined file
+    print(f"Loading combined data from: {paths['combined']}")
+    df_combined = pd.read_excel(paths['combined'])
 
-    # Assign column names based on Bloomberg structure
-    # Column 0: Dates, Column 1: TTF Gas, Column 3: Brent Oil
-    df.columns = ['Date', 'TTF_Gas', 'WTI_Oil', 'Brent_Oil', 'MT1', 'LUA1', 'CP1']
-
-    # Convert date column and filter valid dates
-    df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-    df = df.dropna(subset=['Date'])
-
-    # Convert price columns to numeric
-    df['Brent_Oil'] = pd.to_numeric(df['Brent_Oil'], errors='coerce')
-    df['TTF_Gas'] = pd.to_numeric(df['TTF_Gas'], errors='coerce')
-
-    # Select and rename columns we need
-    df_commodities = df[['Date', 'Brent_Oil', 'TTF_Gas']].copy()
-    df_commodities.columns = ['Date', 'Oil_Price', 'Gas_Price']
-
-    # Filter to 2021-2024 range (matching electricity data)
-    df_commodities = df_commodities[
-        (df_commodities['Date'] >= '2021-01-01') &
-        (df_commodities['Date'] <= '2024-12-31')
-    ]
-
-    print(f"  Loaded {len(df_commodities)} daily commodity observations")
-    print(f"  Date range: {df_commodities['Date'].min().date()} to {df_commodities['Date'].max().date()}")
-    print(f"  Oil Price (Brent): mean={df_commodities['Oil_Price'].mean():.2f}, "
-          f"min={df_commodities['Oil_Price'].min():.2f}, max={df_commodities['Oil_Price'].max():.2f}")
-    print(f"  Gas Price (TTF): mean={df_commodities['Gas_Price'].mean():.2f}, "
-          f"min={df_commodities['Gas_Price'].min():.2f}, max={df_commodities['Gas_Price'].max():.2f}")
-
-    # Report missing values (handled later in load_all_thesis_data with other variables)
-    oil_missing = df_commodities['Oil_Price'].isna().sum()
-    gas_missing = df_commodities['Gas_Price'].isna().sum()
-    if oil_missing > 0 or gas_missing > 0:
-        print(f"  Missing values - Oil: {oil_missing}, Gas: {gas_missing}")
-        print(f"  (Will be handled with other variables via interpolation or row dropping)")
-
-    return df_commodities
-
-
-def load_all_thesis_data(paths, zone_price='SE1', zone_wind='S1', zone_hydro='SE1', zone_exch='SE1', zone_cons='SE1', use_interpolation=False):
-    """Loads and merges all master files based on standardized Timestamps."""
-
-    # Load individual master files
-    df_price = pd.read_excel(paths['price'])
-    df_wind = pd.read_excel(paths['wind'])
-    df_hydro = pd.read_excel(paths['hydro'])
-    df_exch = pd.read_excel(paths['exch'])
-    df_cons = pd.read_excel(paths['cons'])
-
-    # Sequential merge on standardized Timestamp
-    merged = pd.merge(df_price, df_wind, on='Timestamp')
-    merged = pd.merge(merged, df_hydro, on='Timestamp')
-    merged = pd.merge(merged, df_exch, on='Timestamp')
-    merged = pd.merge(merged, df_cons, on='Timestamp')
-
-    # Select specific zone columns for analysis
-    # Note: Column names follow your master file headers exactly
+    # Map columns to standard names
     final_df = pd.DataFrame({
-        'Datetime': pd.to_datetime(merged['Timestamp']),
-        'Price': pd.to_numeric(merged[f'{zone_price}_Price (EUR)'], errors='coerce'),
-        'Wind_Forecast': pd.to_numeric(merged[f'{zone_wind}_Wind'], errors='coerce'),
-        'Hydro_Reserves': pd.to_numeric(merged[f'{zone_hydro}_Hydro_Reserves'], errors='coerce'),
-        'Net_Exchange': pd.to_numeric(merged[f'{zone_exch}_Total_Net_Exchange'], errors='coerce'),
-        'Consumption': pd.to_numeric(merged[zone_cons], errors='coerce')
+        'Datetime': pd.to_datetime(df_combined['Timestamp']),
+        'Price': pd.to_numeric(df_combined['Spot_Price'], errors='coerce'),
+        'Wind_Forecast': pd.to_numeric(df_combined['Wind_Forecast'], errors='coerce'),
+        'Net_Exchange': pd.to_numeric(df_combined['Net_Exchange'], errors='coerce'),
+        'Consumption': pd.to_numeric(df_combined['Consumption_Forecast'], errors='coerce')
     })
 
-    # Load and merge commodity prices (daily -> hourly) if path provided
-    if 'commodities' in paths:
-        df_commodities = load_commodities(paths['commodities'])
+    # Load bottleneck dummy variables (if present in combined file)
+    trading_partners = TRADING_PARTNERS.get(target_region, [])
+    bneck_cols = []
 
-        # Create date column for merging (extract date from hourly Datetime)
-        final_df['Date'] = final_df['Datetime'].dt.date
-        df_commodities['Date'] = df_commodities['Date'].dt.date
+    for partner in trading_partners:
+        bneck_col = f'BNECK_{target_region}_{partner}'
+        if bneck_col in df_combined.columns:
+            final_df[bneck_col] = pd.to_numeric(df_combined[bneck_col], errors='coerce')
+            bneck_cols.append(bneck_col)
+            print(f"    Loaded bottleneck dummy: {bneck_col}")
+        else:
+            print(f"    WARNING: {bneck_col} not found in combined data")
 
-        # Merge commodities on date (each hour gets the daily commodity price)
-        final_df = pd.merge(final_df, df_commodities, on='Date', how='left')
+    if bneck_cols:
+        print(f"  Loaded {len(bneck_cols)} bottleneck dummies for {target_region}")
+    else:
+        print(f"  No bottleneck dummies found for {target_region}")
 
-        # Drop the temporary Date column
-        final_df = final_df.drop(columns=['Date'])
+    print(f"  Combined data: {len(final_df)} observations")
+    print(f"  Date range: {final_df['Datetime'].min()} to {final_df['Datetime'].max()}")
 
-        print(f"  Merged commodity prices: Oil (USD/barrel), Gas (EUR/MWh)")
+    # Step 2: Load and merge hydro reserves
+    if 'hydro' in paths:
+        print(f"\nLoading hydro reserves from: {paths['hydro']}")
+        df_hydro = pd.read_excel(paths['hydro'])
 
-    # Handle missing values based on configuration
+        # Select the appropriate zone column
+        hydro_col = f'{zone_hydro}_Hydro_Reserves'
+        if hydro_col not in df_hydro.columns:
+            raise ValueError(f"Column '{hydro_col}' not found in hydro file. "
+                           f"Available: {df_hydro.columns.tolist()}")
+
+        df_hydro_subset = pd.DataFrame({
+            'Datetime': pd.to_datetime(df_hydro['Timestamp']),
+            'Hydro_Reserves': pd.to_numeric(df_hydro[hydro_col], errors='coerce')
+        })
+
+        print(f"  Hydro data: {len(df_hydro_subset)} observations")
+        print(f"  Date range: {df_hydro_subset['Datetime'].min()} to {df_hydro_subset['Datetime'].max()}")
+
+        # Merge on Datetime
+        final_df = pd.merge(final_df, df_hydro_subset, on='Datetime', how='left')
+        print(f"  After hydro merge: {len(final_df)} observations")
+
+    # Step 3: Load and merge commodity prices (always required)
+    print(f"\nLoading commodities from: {paths['commodities']}")
+
+    # Read commodity file with Bloomberg format (skip header rows)
+    df_comm = pd.read_excel(paths['commodities'], header=None, skiprows=5)
+    df_comm.columns = ['Date', 'TTF_Gas', 'WTI_Oil', 'Brent_Oil', 'MT1', 'LUA1', 'CP1']
+
+    # Process commodity data
+    df_comm['Date'] = pd.to_datetime(df_comm['Date'], errors='coerce')
+    df_comm = df_comm.dropna(subset=['Date'])
+    df_comm['Brent_Oil'] = pd.to_numeric(df_comm['Brent_Oil'], errors='coerce')
+    df_comm['TTF_Gas'] = pd.to_numeric(df_comm['TTF_Gas'], errors='coerce')
+
+    df_commodities = df_comm[['Date', 'Brent_Oil', 'TTF_Gas']].copy()
+    df_commodities.columns = ['Date', 'Oil_Price', 'Gas_Price']
+
+    print(f"  Commodity data: {len(df_commodities)} daily observations")
+    print(f"  Date range: {df_commodities['Date'].min().date()} to {df_commodities['Date'].max().date()}")
+
+    # Create date column for merging (extract date from hourly Datetime)
+    final_df['Date'] = final_df['Datetime'].dt.date
+    df_commodities['Date'] = df_commodities['Date'].dt.date
+
+    # Merge commodities on date (each hour gets the daily commodity price)
+    final_df = pd.merge(final_df, df_commodities, on='Date', how='left')
+    final_df = final_df.drop(columns=['Date'])
+
+    print(f"  Merged commodity prices: Oil (USD/barrel), Gas (EUR/MWh)")
+
+    # Step 3b: Lag commodity prices for day-ahead market alignment
+    print(f"\n--- LAGGING COMMODITY PRICES BY {lag_commodity_hours} HOURS ---")
+    print("Rationale: Day-ahead market pricing uses commodity prices from bidding time (D-1)")
+
+    rows_before_lag = len(final_df)
+
+    # Lag Oil Price
+    oil_before = final_df['Oil_Price'].notna().sum()
+    final_df['Oil_Price'] = final_df['Oil_Price'].shift(lag_commodity_hours)
+    oil_after = final_df['Oil_Price'].notna().sum()
+    oil_lost = oil_before - oil_after
+    print(f"  Oil_Price: Lagged by {lag_commodity_hours}h ({oil_lost} observations lost at start)")
+
+    # Lag Gas Price
+    gas_before = final_df['Gas_Price'].notna().sum()
+    final_df['Gas_Price'] = final_df['Gas_Price'].shift(lag_commodity_hours)
+    gas_after = final_df['Gas_Price'].notna().sum()
+    gas_lost = gas_before - gas_after
+    print(f"  Gas_Price: Lagged by {lag_commodity_hours}h ({gas_lost} observations lost at start)")
+
+    print(f"All subsequent transformations (log, deseasonalization) will use lagged commodity prices")
+
+    # Step 4: Apply date filter if specified
+    if start_date is not None or end_date is not None:
+        rows_before = len(final_df)
+        if start_date is not None:
+            final_df = final_df[final_df['Datetime'] >= pd.to_datetime(start_date)]
+        if end_date is not None:
+            final_df = final_df[final_df['Datetime'] <= pd.to_datetime(end_date)]
+        rows_after = len(final_df)
+        print(f"\nDate filter applied: {rows_before} -> {rows_after} observations")
+        print(f"  Filtered range: {start_date or 'start'} to {end_date or 'end'}")
+
+    # Step 5: Handle missing values
     if use_interpolation:
         print("\n--- APPLYING LINEAR INTERPOLATION FOR MISSING VALUES ---")
 
-        # Show detailed breakdown of missing values by variable
         missing_by_var = final_df.isna().sum()
         missing_before = missing_by_var.sum()
 
-        print(f"\nMissing values by variable (before interpolation):")
-        for var, count in missing_by_var.items():
-            if count > 0:
-                pct = (count / len(final_df)) * 100
-                print(f"  {var}: {count} ({pct:.2f}%)")
+        variables_with_missing = [var for var, count in missing_by_var.items() if count > 0]
+
+        if variables_with_missing:
+            print(f"\nVariables with missing values: {', '.join(variables_with_missing)}")
+            print(f"\nDetailed breakdown:")
+            for var, count in missing_by_var.items():
+                if count > 0:
+                    pct = (count / len(final_df)) * 100
+                    print(f"  {var}: {count} ({pct:.2f}%)")
+        else:
+            print("\nNo missing values detected in any variable.")
 
         print(f"\nTotal missing values: {missing_before}")
 
-        # Apply linear interpolation to fill missing values
         final_df = final_df.interpolate(method='linear', limit_direction='both')
-        # Drop any remaining NaN values (e.g., at edges if interpolation couldn't fill)
         final_df = final_df.dropna()
         missing_after = final_df.isna().sum().sum()
         print(f"Missing values after interpolation: {missing_after}")
         print(f"Rows retained: {len(final_df)}")
     else:
-        # Original behavior: drop all rows with missing values
         rows_before = len(final_df)
 
-        # Show detailed breakdown of missing values by variable
         missing_by_var = final_df.isna().sum()
         if missing_by_var.sum() > 0:
             print(f"\nMissing values by variable (before dropping rows):")
@@ -151,60 +222,180 @@ def load_all_thesis_data(paths, zone_price='SE1', zone_wind='S1', zone_hydro='SE
         final_df = final_df.dropna()
         rows_dropped = rows_before - len(final_df)
         if rows_dropped > 0:
-            print(f"\nDropped {rows_dropped} rows with missing values (original behavior)")
+            print(f"\nDropped {rows_dropped} rows with missing values")
 
-    return final_df.set_index('Datetime')
+    print(f"\n--- FINAL DATASET ---")
+    print(f"Total observations: {len(final_df)}")
+    print(f"Columns: {final_df.columns.tolist()}")
+
+    # Set index and infer hourly frequency
+    final_df = final_df.set_index('Datetime')
+    # Infer frequency from data (should be hourly 'H')
+    inferred_freq = pd.infer_freq(final_df.index)
+    if inferred_freq:
+        final_df = final_df.asfreq(inferred_freq)
+        print(f"Inferred frequency: {inferred_freq}")
+    else:
+        print("Warning: Could not infer frequency from datetime index")
+
+    return final_df
+
+
+def create_progress_bar(total, desc, disable=False):
+    """Create progress bar with fallback to print statements."""
+    if disable or not TQDM_AVAILABLE:
+        class SimpleFallback:
+            def __init__(self, total, desc):
+                self.total = total
+                self.desc = desc
+                self.n = 0
+                self.start_time = __import__('time').time()
+                print(f"\n{desc} (0/{total})")
+
+            def update(self, n=1):
+                self.n += n
+                if self.total > 0:
+                    pct = (self.n / self.total) * 100
+                    # Print at 10% intervals and completion
+                    if self.n == self.total or pct % 10 < (100/self.total):
+                        elapsed = __import__('time').time() - self.start_time
+                        rate = self.n / elapsed if elapsed > 0 else 0
+                        eta = (self.total - self.n) / rate if rate > 0 and self.n < self.total else 0
+                        print(f"  Progress: {self.n}/{self.total} ({pct:.0f}%) | "
+                              f"Elapsed: {elapsed:.0f}s | ETA: {eta:.0f}s")
+
+            def set_description(self, desc):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                elapsed = __import__('time').time() - self.start_time
+                print(f"  Completed: {self.n}/{self.total} in {elapsed:.0f}s\n")
+
+        return SimpleFallback(total, desc)
+
+    return tqdm(
+        total=total,
+        desc=desc,
+        unit='it',
+        bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+        ncols=100
+    )
 
 
 # --- 2. DATA PREPROCESSING FUNCTIONS ---
 
-def lag_commodity_prices(df, lag_hours=24):
+def handle_negative_prices(df, method='clip'):
     """
-    Lag commodity prices (oil and gas) by specified hours (default: 24 hours).
+    Check all variables for negative values and handle Price column using specified method.
 
-    Rationale:
-    - Electricity spot prices are determined in day-ahead auctions (day D-1 for delivery on day D)
-    - Oil and gas prices should reflect information available at the time of bidding (24h before delivery)
-    - This aligns commodity prices with the information set used when electricity prices were set
+    First checks all variables (except Net_Exchange) and reports negative values.
+    Then handles negative Price values using the chosen method.
 
-    Following standard practice in electricity price modeling literature (Weron, Huisman, etc.)
+    Two methods available for Price:
+    1. 'clip': Replace negative/zero values with 0.01 (current default)
+    2. 'shift': Shift entire series upward so minimum value becomes 0.01
 
     Parameters:
-    - df: DataFrame with Oil_Price and/or Gas_Price columns
-    - lag_hours: Number of hours to lag (default 24 for day-ahead market)
+    - df: DataFrame with variables
+    - method: 'clip' or 'shift' (for Price handling only)
 
     Returns:
-    - DataFrame with lagged commodity prices (NaN values from lagging are dropped)
+    - DataFrame with adjusted Price column (if needed)
     """
-    print(f"\n--- LAGGING COMMODITY PRICES BY {lag_hours} HOURS ---")
-    print("Rationale: Day-ahead market pricing uses commodity prices from bidding time (D-1)")
+    print("\n" + "="*80)
+    print("NEGATIVE VALUE CHECK & PRICE HANDLING")
+    print("="*80)
 
-    rows_before_lag = len(df)
+    # --- PART 1: Check all variables for negative values ---
+    print("\nChecking all variables for negative values (except Net_Exchange)...\n")
 
-    if 'Oil_Price' in df.columns:
-        oil_before = df['Oil_Price'].notna().sum()
-        df['Oil_Price'] = df['Oil_Price'].shift(lag_hours)
-        oil_after = df['Oil_Price'].notna().sum()
-        oil_lost = oil_before - oil_after
-        print(f"  Oil_Price: Lagged by {lag_hours}h ({oil_lost} observations lost at start)")
+    variables_to_check = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Consumption',
+                         'Oil_Price', 'Gas_Price']
 
-    if 'Gas_Price' in df.columns:
-        gas_before = df['Gas_Price'].notna().sum()
-        df['Gas_Price'] = df['Gas_Price'].shift(lag_hours)
-        gas_after = df['Gas_Price'].notna().sum()
-        gas_lost = gas_before - gas_after
-        print(f"  Gas_Price: Lagged by {lag_hours}h ({gas_lost} observations lost at start)")
+    negative_stats = {}
+    found_negatives = False
 
-    # Drop rows with NaN values created by lagging
-    df = df.dropna()
-    rows_after_drop = len(df)
-    rows_dropped = rows_before_lag - rows_after_drop
+    for var in variables_to_check:
+        if var in df.columns:
+            min_val = df[var].min()
+            negative_count = (df[var] < 0).sum()
+            negative_pct = (negative_count / len(df)) * 100
+            zero_count = (df[var] == 0).sum()
 
-    print(f"\nDropped {rows_dropped} rows with NaN values created by lagging")
-    print(f"Rows retained: {rows_after_drop}")
-    print("All subsequent transformations (log, deseasonalization) will use lagged commodity prices")
+            negative_stats[var] = {
+                'min': min_val,
+                'negative_count': negative_count,
+                'negative_pct': negative_pct,
+                'zero_count': zero_count
+            }
 
-    return df
+            if negative_count > 0:
+                found_negatives = True
+                print(f"  {var}:")
+                print(f"    Min value: {min_val:.4f}")
+                print(f"    Negative values: {negative_count} ({negative_pct:.2f}%)")
+                print(f"    Zero values: {zero_count}")
+        else:
+            print(f"  {var}: NOT FOUND in dataframe")
+
+    if not found_negatives:
+        print("  ✓ No negative values found in any variable")
+
+    print("\n  Net_Exchange: NOT CHECKED (expected to have negative values)")
+
+    # --- PART 2: Handle Price variable ---
+    print("\n" + "-"*80)
+    print("HANDLING PRICE VARIABLE")
+    print("-"*80)
+
+    if 'Price' not in df.columns:
+        print("Warning: Price column not found. Skipping price handling.")
+        print("="*80 + "\n")
+        return df
+
+    min_price = df['Price'].min()
+    negative_count = (df['Price'] < 0).sum()
+    zero_count = (df['Price'] == 0).sum()
+
+    print(f"Method: {method.upper()}")
+    print(f"\nPrice statistics:")
+    print(f"  Minimum value: {min_price:.4f}")
+    print(f"  Negative values: {negative_count} ({(negative_count/len(df))*100:.2f}%)")
+    print(f"  Zero values: {zero_count} ({(zero_count/len(df))*100:.2f}%)")
+
+    df_clean = df.copy()
+
+    if method == 'clip':
+        # Current method: clip to 0.01
+        if min_price < 0.01:
+            below_threshold = (df['Price'] < 0.01).sum()
+            df_clean['Price'] = df_clean['Price'].clip(lower=0.01)
+            print(f"\nCLIP METHOD: Replaced {below_threshold} values below 0.01 with 0.01")
+        else:
+            print("\nCLIP METHOD: No values below 0.01, no clipping needed")
+
+    elif method == 'shift':
+        # New method: shift entire series upward
+        if min_price < 0.01:
+            shift_amount = 0.01 - min_price
+            df_clean['Price'] = df_clean['Price'] + shift_amount
+            new_min = df_clean['Price'].min()
+            print(f"\nSHIFT METHOD: Shifted entire series upward by {shift_amount:.4f}")
+            print(f"  Old minimum: {min_price:.4f}")
+            print(f"  New minimum: {new_min:.4f}")
+            print(f"  All {len(df)} observations shifted by the same amount")
+        else:
+            print("\nSHIFT METHOD: Minimum value already >= 0.01, no shift needed")
+
+    else:
+        raise ValueError(f"Unknown method '{method}'. Use 'clip' or 'shift'")
+
+    print("="*80 + "\n")
+
+    return df_clean
 
 
 def handle_outliers_fredriksson(df, use_log_transform=False, use_deseasonalized=False):
@@ -292,12 +483,9 @@ def handle_outliers_fredriksson(df, use_log_transform=False, use_deseasonalized=
         print(f"\n  Replacing with mean of ±24h and ±48h surrounding values...")
 
         # Replace each outlier with mean of surrounding hours
-        outlier_indices = data[outliers].index
+        outlier_positions = np.where(outliers)[0]
 
-        for idx in outlier_indices:
-            # Get position in the series
-            pos = df_clean.index.get_loc(idx)
-
+        for pos in outlier_positions:
             # Calculate mean of 24 and 48 hours before and after
             surrounding_values = []
 
@@ -543,25 +731,9 @@ def deseasonalize_logged_variables(df):
     df['Hour'] = df.index.hour
 
     # Create holiday indicator for Swedish/Nordic holidays
-    # Following Fredriksson (2016), we include major Swedish holidays
-    try:
-        import holidays
-        swedish_holidays = holidays.Sweden(years=range(df.index.year.min(), df.index.year.max() + 1))
-        df['Holiday'] = df.index.to_series().apply(lambda x: 1 if x.date() in swedish_holidays else 0).values
-        print("\nHoliday dummies created using Swedish holiday calendar")
-    except ImportError:
-        # Fallback: simple holiday definition if holidays package not available
-        print("\nWarning: 'holidays' package not found. Using basic holiday definition.")
-        print("Install with: pip install holidays")
-        # Define basic holidays manually (New Year, Christmas, Midsummer, etc.)
-        df['Holiday'] = 0
-        for date in df.index:
-            # New Year's Day
-            if (date.month == 1 and date.day == 1) or \
-               (date.month == 12 and date.day in [24, 25, 26, 31]) or \
-               (date.month == 6 and date.day in [19, 20, 21, 22, 23, 24, 25, 26]) or \
-               (date.month == 5 and date.day == 1):  # Labor Day, Midsummer, Christmas
-                df.loc[date, 'Holiday'] = 1
+    swedish_holidays = holidays.Sweden(years=range(df.index.year.min(), df.index.year.max() + 1))
+    df['Holiday'] = df.index.to_series().apply(lambda x: 1 if x.date() in swedish_holidays else 0).values
+    print("\nHoliday dummies created using Swedish holiday calendar")
 
     # Create dummy variables (drop_first=True avoids multicollinearity)
     year_dummies = pd.get_dummies(df['Year'], prefix='Year', drop_first=True, dtype=float)
@@ -629,18 +801,16 @@ def deseasonalize_logged_variables(df):
     # END TEMPORARY
 
     # Deseasonalize Oil_Price_Log (PARTIAL - Year + Month only)
-    if 'Oil_Price_Log' in df.columns:
-        oil_log_model = sm.OLS(df['Oil_Price_Log'], seasonal_dummies_partial).fit()
-        df['Oil_Price_Log_Deseasonalized'] = oil_log_model.resid
-        print(f"Oil_Price_Log: Seasonal R² = {oil_log_model.rsquared:.4f}")
-        print(f"  Original std: {df['Oil_Price_Log'].std():.4f}, Deseasonalized std: {df['Oil_Price_Log_Deseasonalized'].std():.4f}")
+    oil_log_model = sm.OLS(df['Oil_Price_Log'], seasonal_dummies_partial).fit()
+    df['Oil_Price_Log_Deseasonalized'] = oil_log_model.resid
+    print(f"Oil_Price_Log: Seasonal R² = {oil_log_model.rsquared:.4f}")
+    print(f"  Original std: {df['Oil_Price_Log'].std():.4f}, Deseasonalized std: {df['Oil_Price_Log_Deseasonalized'].std():.4f}")
 
     # Deseasonalize Gas_Price_Log (PARTIAL - Year + Month only)
-    if 'Gas_Price_Log' in df.columns:
-        gas_log_model = sm.OLS(df['Gas_Price_Log'], seasonal_dummies_partial).fit()
-        df['Gas_Price_Log_Deseasonalized'] = gas_log_model.resid
-        print(f"Gas_Price_Log: Seasonal R² = {gas_log_model.rsquared:.4f}")
-        print(f"  Original std: {df['Gas_Price_Log'].std():.4f}, Deseasonalized std: {df['Gas_Price_Log_Deseasonalized'].std():.4f}")
+    gas_log_model = sm.OLS(df['Gas_Price_Log'], seasonal_dummies_partial).fit()
+    df['Gas_Price_Log_Deseasonalized'] = gas_log_model.resid
+    print(f"Gas_Price_Log: Seasonal R² = {gas_log_model.rsquared:.4f}")
+    print(f"  Original std: {df['Gas_Price_Log'].std():.4f}, Deseasonalized std: {df['Gas_Price_Log_Deseasonalized'].std():.4f}")
 
     # Clean up temporary columns
     df = df.drop(columns=['Year', 'Month', 'DayOfWeek', 'Hour', 'Holiday'])
@@ -658,18 +828,22 @@ def apply_log_transform(df):
     Logs applied to: Price, Wind_Forecast, Hydro_Reserves, Consumption, Oil_Price, Gas_Price
     NOT logged: Net_Exchange (can contain negative values)
 
-    Note: Oil_Price and Gas_Price are already lagged by 24h (from lag_commodity_prices step)
+    Note:
+    - Oil_Price and Gas_Price are already lagged by 24h (automatically in load_data)
+    - Price negative values are already handled by handle_negative_prices()
+    - Other variables are clipped to 0.01 to handle zeros and edge cases
 
     Returns df with logged columns: Price_Log, Wind_Forecast_Log, Hydro_Reserves_Log,
     Consumption_Log, Oil_Price_Log, Gas_Price_Log
     """
     print("\n--- APPLYING LOGARITHMIC TRANSFORMATION (STANDARD APPROACH) ---")
     print("Log transformation applied BEFORE deseasonalization")
-    print("Note: Oil & Gas prices are already lagged by 24h (day-ahead market alignment)")
+    print("Note: Oil & Gas prices are already lagged by 24h (automatically in load_data)")
+    print("Note: Price negative values already handled by handle_negative_prices()")
 
-    # Log Price
-    df['Price_Log'] = np.log(df['Price'].clip(lower=0.01))
-    print(f"Price: log(raw) applied")
+    # Log Price (no clipping - negative values already handled)
+    df['Price_Log'] = np.log(df['Price'])
+    print(f"Price: log(raw) applied [no clipping - negatives already handled]")
 
     # Log Wind Forecast
     df['Wind_Forecast_Log'] = np.log(df['Wind_Forecast'].clip(lower=0.01))
@@ -714,15 +888,13 @@ def apply_log_transform(df):
     # Net_Exchange - NOT logged (can be negative)
     print(f"Net_Exchange: NOT logged (contains negative values)")
 
-    # Log Oil Price (if available)
-    if 'Oil_Price' in df.columns:
-        df['Oil_Price_Log'] = np.log(df['Oil_Price'].clip(lower=0.01))
-        print(f"Oil_Price: log(raw) applied [USD/barrel]")
+    # Log Oil Price
+    df['Oil_Price_Log'] = np.log(df['Oil_Price'].clip(lower=0.01))
+    print(f"Oil_Price: log(raw) applied [USD/barrel]")
 
-    # Log Gas Price (if available)
-    if 'Gas_Price' in df.columns:
-        df['Gas_Price_Log'] = np.log(df['Gas_Price'].clip(lower=0.01))
-        print(f"Gas_Price: log(raw) applied [EUR/MWh]")
+    # Log Gas Price
+    df['Gas_Price_Log'] = np.log(df['Gas_Price'].clip(lower=0.01))
+    print(f"Gas_Price: log(raw) applied [EUR/MWh]")
 
     return df
 
@@ -999,10 +1171,17 @@ def run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, use_log_transform=True,
     # Fit the model
     tvp_model = TVPWind(y_star, w_star)
 
+    print("\n--- Fitting TVP Model (this may take 1-5 minutes) ---")
+    import time
+    start_time = time.time()
+
     import warnings
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore')
         tvp_results = tvp_model.fit(disp=False)
+
+    elapsed_time = time.time() - start_time
+    print(f"Model fitting completed in {elapsed_time:.1f} seconds ({elapsed_time/60:.1f} minutes)")
 
     # Step 5: Extract results
     beta_t = tvp_results.smoothed_state[0]
@@ -1087,7 +1266,7 @@ def run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, use_log_transform=True,
 
 def run_rolling_window_analysis(df, zone, Y, exog_vars, use_log_transform,
                                 window_years=3, step_years=1, min_obs=24*180,
-                                plots_dir="plots", results_dir="results"):
+                                plots_dir="plots", results_dir="results", show_progress=True):
     """
     Estimate wind coefficient using overlapping rolling windows with OLS.
 
@@ -1135,45 +1314,60 @@ def run_rolling_window_analysis(df, zone, Y, exog_vars, use_log_transform,
     start_date = tmp.index.min()
     end_of_data = tmp.index.max()
 
-    window_count = 0
-    print(f"\n--- Estimating Rolling Windows ---")
-
+    # Count total windows for progress tracking
+    total_windows = 0
+    temp_start = start_date
     while True:
-        window_end = start_date + relativedelta(years=window_years)
-        if window_end > end_of_data:
+        temp_end = temp_start + relativedelta(years=window_years)
+        if temp_end > end_of_data:
             break
+        temp_window = tmp[(tmp.index >= temp_start) & (tmp.index < temp_end)]
+        if len(temp_window) >= min_obs:
+            total_windows += 1
+        temp_start = temp_start + relativedelta(years=step_years)
 
-        window_data = tmp[(tmp.index >= start_date) & (tmp.index < window_end)]
+    print(f"\n--- Estimating Rolling Windows ---")
+    print(f"Total windows to estimate: {total_windows}")
 
-        if len(window_data) >= min_obs:
-            window_count += 1
+    window_count = 0
+    pbar = create_progress_bar(total=total_windows, desc="Rolling window estimation", disable=not show_progress)
 
-            # Run OLS regression with Newey-West (HAC) standard errors
-            X = sm.add_constant(window_data[exog_vars])
-            y = window_data[Y.name]
-            model = sm.OLS(y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 24})
+    with pbar:
+        while True:
+            window_end = start_date + relativedelta(years=window_years)
+            if window_end > end_of_data:
+                break
 
-            # Calculate window midpoint
-            window_midpoint = start_date + relativedelta(months=window_years * 6)
+            window_data = tmp[(tmp.index >= start_date) & (tmp.index < window_end)]
 
-            # Record results
-            results.append({
-                'window_start': start_date,
-                'window_end': window_end,
-                'window_midpoint': window_midpoint,
-                'beta_wind': model.params[wind_col],
-                'se_wind': model.bse[wind_col],
-                't_stat': model.tvalues[wind_col],
-                'pvalue': model.pvalues[wind_col],
-                'n_obs': len(window_data),
-                'r_squared': model.rsquared
-            })
+            if len(window_data) >= min_obs:
+                window_count += 1
+                pbar.set_description(f"Window {window_count}/{total_windows}: {start_date.strftime('%Y-%m')}")
 
-            print(f"  Window {window_count}: {start_date.strftime('%Y-%m-%d')} to "
-                  f"{window_end.strftime('%Y-%m-%d')} | n={len(window_data):,} | "
-                  f"beta={model.params[wind_col]:.6f} | p={model.pvalues[wind_col]:.4f}")
+                # Run OLS regression with Newey-West (HAC) standard errors
+                X = sm.add_constant(window_data[exog_vars])
+                y = window_data[Y.name]
+                model = sm.OLS(y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 24})
 
-        start_date = start_date + relativedelta(years=step_years)
+                # Calculate window midpoint
+                window_midpoint = start_date + relativedelta(months=window_years * 6)
+
+                # Record results
+                results.append({
+                    'window_start': start_date,
+                    'window_end': window_end,
+                    'window_midpoint': window_midpoint,
+                    'beta_wind': model.params[wind_col],
+                    'se_wind': model.bse[wind_col],
+                    't_stat': model.tvalues[wind_col],
+                    'pvalue': model.pvalues[wind_col],
+                    'n_obs': len(window_data),
+                    'r_squared': model.rsquared
+                })
+
+                pbar.update(1)
+
+            start_date = start_date + relativedelta(years=step_years)
 
     if not results:
         print("\nWARNING: No valid windows found. Check data range and window parameters.")
@@ -1265,7 +1459,7 @@ def run_rolling_window_analysis(df, zone, Y, exog_vars, use_log_transform,
 
 
 def run_quantile_regression_analysis(df, zone, use_log_transform,
-                                     plots_dir="plots", results_dir="results"):
+                                     plots_dir="plots", results_dir="results", show_progress=True):
     """
     Estimate wind coefficient across quantiles of the price distribution.
 
@@ -1327,27 +1521,19 @@ def run_quantile_regression_analysis(df, zone, use_log_transform,
     else:
         print("  Note: 'Net_Exchange' not found, skipping")
 
-    # Oil price (optional)
-    oil_col = None
-    if use_log_transform and 'Oil_Price_Log' in df.columns:
+    # Oil price (always included)
+    if use_log_transform:
         oil_col = 'Oil_Price_Log'
-        econ_vars.append(oil_col)
-    elif 'Oil_Price' in df.columns:
+    else:
         oil_col = 'Oil_Price'
-        econ_vars.append(oil_col)
-    else:
-        print("  Note: Oil price not found, skipping")
+    econ_vars.append(oil_col)
 
-    # Gas price (optional)
-    gas_col = None
-    if use_log_transform and 'Gas_Price_Log' in df.columns:
+    # Gas price (always included)
+    if use_log_transform:
         gas_col = 'Gas_Price_Log'
-        econ_vars.append(gas_col)
-    elif 'Gas_Price' in df.columns:
-        gas_col = 'Gas_Price'
-        econ_vars.append(gas_col)
     else:
-        print("  Note: Gas price not found, skipping")
+        gas_col = 'Gas_Price'
+    econ_vars.append(gas_col)
 
     print(f"\nEconomic regressors: {econ_vars}")
 
@@ -1423,40 +1609,43 @@ def run_quantile_regression_analysis(df, zone, use_log_transform,
     # TODO: Block bootstrap can be added later for time-series-robust inference
 
     results = []
-    for q in QUANTILES:
-        print(f"  Estimating q={q:.2f}...", end='')
+    pbar = create_progress_bar(total=len(QUANTILES), desc="Quantile regression", disable=not show_progress)
 
-        model = sm.QuantReg(y, X)
-        res = model.fit(q=q)
+    with pbar:
+        for q in QUANTILES:
+            pbar.set_description(f"Quantile q={q:.2f}")
 
-        # Extract coefficients for key variables
-        result_row = {
-            'quantile': q,
-            'beta_wind': res.params[wind_col],
-            'se_wind': res.bse[wind_col] if wind_col in res.bse.index else np.nan,
-            'p_wind': res.pvalues[wind_col] if wind_col in res.pvalues.index else np.nan,
-            'beta_demand': res.params[demand_col],
-            'se_demand': res.bse[demand_col] if demand_col in res.bse.index else np.nan,
-            'p_demand': res.pvalues[demand_col] if demand_col in res.pvalues.index else np.nan,
-            'beta_hydro': res.params[hydro_col],
-            'se_hydro': res.bse[hydro_col] if hydro_col in res.bse.index else np.nan,
-            'p_hydro': res.pvalues[hydro_col] if hydro_col in res.pvalues.index else np.nan,
-            'n_obs': int(res.nobs)
-        }
+            model = sm.QuantReg(y, X)
+            res = model.fit(q=q)
 
-        # Add oil/gas if available
-        if oil_col and oil_col in res.params.index:
-            result_row['beta_oil'] = res.params[oil_col]
-            result_row['se_oil'] = res.bse[oil_col] if oil_col in res.bse.index else np.nan
-            result_row['p_oil'] = res.pvalues[oil_col] if oil_col in res.pvalues.index else np.nan
+            # Extract coefficients for key variables
+            result_row = {
+                'quantile': q,
+                'beta_wind': res.params[wind_col],
+                'se_wind': res.bse[wind_col] if wind_col in res.bse.index else np.nan,
+                'p_wind': res.pvalues[wind_col] if wind_col in res.pvalues.index else np.nan,
+                'beta_demand': res.params[demand_col],
+                'se_demand': res.bse[demand_col] if demand_col in res.bse.index else np.nan,
+                'p_demand': res.pvalues[demand_col] if demand_col in res.pvalues.index else np.nan,
+                'beta_hydro': res.params[hydro_col],
+                'se_hydro': res.bse[hydro_col] if hydro_col in res.bse.index else np.nan,
+                'p_hydro': res.pvalues[hydro_col] if hydro_col in res.pvalues.index else np.nan,
+                'n_obs': int(res.nobs)
+            }
 
-        if gas_col and gas_col in res.params.index:
-            result_row['beta_gas'] = res.params[gas_col]
-            result_row['se_gas'] = res.bse[gas_col] if gas_col in res.bse.index else np.nan
-            result_row['p_gas'] = res.pvalues[gas_col] if gas_col in res.pvalues.index else np.nan
+            # Add oil/gas if available
+            if oil_col and oil_col in res.params.index:
+                result_row['beta_oil'] = res.params[oil_col]
+                result_row['se_oil'] = res.bse[oil_col] if oil_col in res.bse.index else np.nan
+                result_row['p_oil'] = res.pvalues[oil_col] if oil_col in res.pvalues.index else np.nan
 
-        results.append(result_row)
-        print(f" beta_wind={result_row['beta_wind']:.6f}, p={result_row['p_wind']:.4f}")
+            if gas_col and gas_col in res.params.index:
+                result_row['beta_gas'] = res.params[gas_col]
+                result_row['se_gas'] = res.bse[gas_col] if gas_col in res.bse.index else np.nan
+                result_row['p_gas'] = res.pvalues[gas_col] if gas_col in res.pvalues.index else np.nan
+
+            results.append(result_row)
+            pbar.update(1)
 
     # Create results DataFrame
     results_df = pd.DataFrame(results)
@@ -1553,7 +1742,7 @@ def run_quantile_regression_analysis(df, zone, use_log_transform,
     print("="*80)
 
 
-def select_armax_lags_aic(Y, exog_vars, max_p=10, max_q=10):
+def select_armax_lags_aic(Y, exog_vars, max_p=10, max_q=10, show_progress=True):
     """
     Automated lag selection for ARMAX model using AIC minimization.
 
@@ -1570,34 +1759,29 @@ def select_armax_lags_aic(Y, exog_vars, max_p=10, max_q=10):
     best_order = None
     results_table = []
 
+    total_iterations = max_p * max_q
+    pbar = create_progress_bar(total=total_iterations, desc="Testing ARMAX models", disable=not show_progress)
+
     import warnings
+    with pbar:
+        for p in range(1, max_p + 1):
+            for q in range(1, max_q + 1):
+                try:
+                    pbar.set_description(f"Testing ARMAX({p},{q})")
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings('ignore')
+                        model = sm.tsa.ARIMA(Y, exog=exog_vars, order=(p, 0, q))
+                        fitted = model.fit()
+                        aic = fitted.aic
+                        results_table.append({'p': p, 'q': q, 'AIC': aic})
 
-    for p in range(1, max_p + 1):
-        for q in range(1, max_q + 1):
-            try:
-                print(f"  Testing ARMAX({p},{q})...", end='')
-
-                # Suppress convergence warnings for cleaner output
-                with warnings.catch_warnings():
-                    warnings.filterwarnings('ignore')
-                    model = sm.tsa.ARIMA(Y, exog=exog_vars, order=(p, 0, q))
-                    fitted = model.fit()
-
-                    aic = fitted.aic
-                    results_table.append({'p': p, 'q': q, 'AIC': aic})
-
-                    if aic < best_aic:
-                        best_aic = aic
-                        best_order = (p, q)
-                        print(f" AIC={aic:.2f} *** NEW BEST ***")
-                    else:
-                        print(f" AIC={aic:.2f}")
-
-            except Exception as e:
-                print(f" FAILED (convergence error)")
-                # Skip models that fail to converge
-                results_table.append({'p': p, 'q': q, 'AIC': np.nan})
-                continue
+                        if aic < best_aic:
+                            best_aic = aic
+                            best_order = (p, q)
+                except Exception as e:
+                    results_table.append({'p': p, 'q': q, 'AIC': np.nan})
+                finally:
+                    pbar.update(1)
 
     print(f"\n{'='*70}")
     print(f"OPTIMAL MODEL SELECTED: ARMAX{best_order} with AIC = {best_aic:.2f}")
@@ -1617,16 +1801,19 @@ def select_armax_lags_aic(Y, exog_vars, max_p=10, max_q=10):
     return best_order
 
 
-def perform_multivariate_analysis(df, zone, use_log_transform=False, use_deseasonalized=False,
+def perform_multivariate_analysis(df, zone, target_region='SE1', use_log_transform=False, use_deseasonalized=False,
                                  run_ljungbox=False, run_hetero_tests=False, run_stationarity=False,
                                  optimize_armax_lags=False, run_tvp_wind_kalman=False,
                                  run_rolling_window=False, rolling_window_years=3,
                                  rolling_step_years=1, rolling_min_obs=24*180,
-                                 run_quantile_regression=False):
+                                 run_quantile_regression=False, show_progress=True):
     """
     Runs OLS and ARMAX-GARCHX with full control variables and optional diagnostic tests.
 
     Parameters:
+    - df: DataFrame with all variables
+    - zone: Zone identifier for display purposes
+    - target_region: Target region for bottleneck dummies (default 'SE1')
     - use_log_transform: Use logged variables
     - use_deseasonalized: Use deseasonalized (logged) variables
     """
@@ -1647,11 +1834,16 @@ def perform_multivariate_analysis(df, zone, use_log_transform=False, use_deseaso
             'Consumption_Log_Deseasonalized'
         ]
 
-        # Add commodity controls if available (deseasonalized versions)
-        if 'Oil_Price_Log_Deseasonalized' in df.columns:
-            exog_vars.append('Oil_Price_Log_Deseasonalized')
-        if 'Gas_Price_Log_Deseasonalized' in df.columns:
-            exog_vars.append('Gas_Price_Log_Deseasonalized')
+        # Add commodity controls (deseasonalized versions)
+        exog_vars.append('Oil_Price_Log_Deseasonalized')
+        exog_vars.append('Gas_Price_Log_Deseasonalized')
+
+        # Add bottleneck dummies (not transformed - binary variables)
+        trading_partners = TRADING_PARTNERS.get(target_region, [])
+        for partner in trading_partners:
+            bneck_col = f'BNECK_{target_region}_{partner}'
+            if bneck_col in df.columns:
+                exog_vars.append(bneck_col)
 
     elif use_log_transform:
         print("Using: Logged variables only (no deseasonalization)")
@@ -1667,11 +1859,16 @@ def perform_multivariate_analysis(df, zone, use_log_transform=False, use_deseaso
             'Consumption_Log'
         ]
 
-        # Add commodity controls if available (logged versions)
-        if 'Oil_Price_Log' in df.columns:
-            exog_vars.append('Oil_Price_Log')
-        if 'Gas_Price_Log' in df.columns:
-            exog_vars.append('Gas_Price_Log')
+        # Add commodity controls (logged versions)
+        exog_vars.append('Oil_Price_Log')
+        exog_vars.append('Gas_Price_Log')
+
+        # Add bottleneck dummies (not transformed - binary variables)
+        trading_partners = TRADING_PARTNERS.get(target_region, [])
+        for partner in trading_partners:
+            bneck_col = f'BNECK_{target_region}_{partner}'
+            if bneck_col in df.columns:
+                exog_vars.append(bneck_col)
 
     else:
         print("Using: Raw variables (no log transformation or deseasonalization)")
@@ -1682,11 +1879,16 @@ def perform_multivariate_analysis(df, zone, use_log_transform=False, use_deseaso
         # Exogenous variables: raw versions
         exog_vars = ['Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']
 
-        # Add commodity controls if available (raw versions)
-        if 'Oil_Price' in df.columns:
-            exog_vars.append('Oil_Price')
-        if 'Gas_Price' in df.columns:
-            exog_vars.append('Gas_Price')
+        # Add commodity controls (raw versions)
+        exog_vars.append('Oil_Price')
+        exog_vars.append('Gas_Price')
+
+        # Add bottleneck dummies (not transformed - binary variables)
+        trading_partners = TRADING_PARTNERS.get(target_region, [])
+        for partner in trading_partners:
+            bneck_col = f'BNECK_{target_region}_{partner}'
+            if bneck_col in df.columns:
+                exog_vars.append(bneck_col)
 
     print(f"Dependent variable: {Y.name}")
     print(f"Exogenous variables: {exog_vars}")
@@ -1703,14 +1905,16 @@ def perform_multivariate_analysis(df, zone, use_log_transform=False, use_deseaso
                                     step_years=rolling_step_years,
                                     min_obs=rolling_min_obs,
                                     plots_dir="plots",
-                                    results_dir="results")
+                                    results_dir="results",
+                                    show_progress=show_progress)
         return None, None  # Early return, skip OLS/ARMAX
 
     # Quantile regression mode: run quantile regression analysis and return early
     if run_quantile_regression:
         run_quantile_regression_analysis(df, zone, use_log_transform,
                                          plots_dir="plots",
-                                         results_dir="results")
+                                         results_dir="results",
+                                         show_progress=show_progress)
         return None, None  # Early return, skip OLS/ARMAX
 
     X = sm.add_constant(df[exog_vars])
@@ -1747,14 +1951,23 @@ def perform_multivariate_analysis(df, zone, use_log_transform=False, use_deseaso
 
     # Determine optimal lags if enabled, otherwise use default (3,3)
     if optimize_armax_lags:
-        optimal_order = select_armax_lags_aic(Y, df[exog_vars], max_p=10, max_q=10)
+        optimal_order = select_armax_lags_aic(Y, df[exog_vars], max_p=10, max_q=10,
+                                               show_progress=show_progress)
         armax_order = (optimal_order[0], 0, optimal_order[1])
     else:
         armax_order = (3, 0, 3)
         print(f"Using default ARMAX{armax_order} specification (set OPTIMIZE_ARMAX_LAGS=True for AIC-based selection)")
 
     # Mean Equation (Price Level)
+    print(f"\n--- Fitting ARMAX{armax_order} model (this may take 10-30 seconds) ---")
+    import time
+    start_time = time.time()
+
     armax_res = sm.tsa.ARIMA(Y, exog=df[exog_vars], order=armax_order).fit()
+
+    elapsed_time = time.time() - start_time
+    print(f"ARMAX fitting completed in {elapsed_time:.1f} seconds\n")
+
     print(f"\nMEAN EQUATION (Price Level) - ARMAX{armax_order}:")
     print(armax_res.summary())
 
@@ -1774,14 +1987,15 @@ def perform_multivariate_analysis(df, zone, use_log_transform=False, use_deseaso
 
 # --- 5. VISUALIZATION FUNCTIONS ---
 
-def plot_time_series(df, zone, plots_dir='plots'):
+def plot_time_series(df, zone, stage='raw', plots_dir='plots'):
     """Create time series plots for all variables."""
 
     print("\n--- Creating Time Series Plots ---")
     sns.set_style("whitegrid")
 
     fig, axes = plt.subplots(5, 1, figsize=(16, 20))
-    fig.suptitle(f'Raw Time Series Data - {zone} (2021-2024)', fontsize=16, fontweight='bold')
+    stage_title = stage.replace('_', ' ').title()
+    fig.suptitle(f'{stage_title} Time Series Data - {zone} (2021-2024)', fontsize=16, fontweight='bold')
 
     variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']
     colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6']
@@ -1804,19 +2018,32 @@ def plot_time_series(df, zone, plots_dir='plots'):
     plt.tight_layout()
 
     # Save to plots directory
-    filepath = os.path.join(plots_dir, f'raw_time_series_{zone}.png')
+    filepath = os.path.join(plots_dir, f'{stage}_time_series_{zone}.png')
     plt.savefig(filepath, dpi=300, bbox_inches='tight')
     print(f"  Saved: {filepath}")
     plt.close()
 
 
-def plot_distributions(df, zone, plots_dir='plots'):
+def plot_distributions(df, zone, method='fredriksson', stage='raw', plots_dir='plots'):
     """Create distribution plots (histograms + KDE) for all variables."""
 
     print("\n--- Creating Distribution Plots ---")
 
+    # Set thresholds based on method
+    if method == 'fredriksson':
+        upper_mult = 6.0
+        lower_mult = -3.7
+        method_label = 'Fredriksson'
+    elif method == 'gianfreda':
+        upper_mult = 3.0
+        lower_mult = -3.0
+        method_label = 'Gianfreda'
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    fig.suptitle(f'Distribution of Raw Variables - {zone} (with outlier detection)', fontsize=16, fontweight='bold')
+    stage_title = stage.replace('_', ' ').title()
+    fig.suptitle(f'Distribution of {stage_title} Variables - {zone} (with outlier detection)', fontsize=16, fontweight='bold')
 
     variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']
     colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6']
@@ -1845,11 +2072,11 @@ def plot_distributions(df, zone, plots_dir='plots'):
         ax.axvline(mean_val, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_val:.2f}')
         ax.axvline(median_val, color='green', linestyle='--', linewidth=2, label=f'Median: {median_val:.2f}')
 
-        # Mark 6x std threshold (Fredriksson outlier definition)
-        upper_6std = mean_val + 6 * std_val
-        lower_3_7std = mean_val - 3.7 * std_val
-        ax.axvline(upper_6std, color='orange', linestyle=':', linewidth=2, label=f'+6*std: {upper_6std:.2f}')
-        ax.axvline(lower_3_7std, color='orange', linestyle=':', linewidth=2, label=f'-3.7*std: {lower_3_7std:.2f}')
+        # Mark outlier thresholds based on method
+        upper_threshold = mean_val + upper_mult * std_val
+        lower_threshold = mean_val + lower_mult * std_val
+        ax.axvline(upper_threshold, color='orange', linestyle=':', linewidth=2, label=f'{upper_mult:+.1f}*std: {upper_threshold:.2f}')
+        ax.axvline(lower_threshold, color='orange', linestyle=':', linewidth=2, label=f'{lower_mult:+.1f}*std: {lower_threshold:.2f}')
 
         ax.set_title(f'{var}', fontsize=14, fontweight='bold')
         ax.set_xlabel(f'{unit}', fontsize=12)
@@ -1857,13 +2084,13 @@ def plot_distributions(df, zone, plots_dir='plots'):
         ax.legend(loc='best', fontsize=9)
         ax.grid(True, alpha=0.3)
 
-        # Count outliers using Fredriksson definition
-        outliers_upper = (data > upper_6std).sum()
-        outliers_lower = (data < lower_3_7std).sum()
+        # Count outliers using specified method
+        outliers_upper = (data > upper_threshold).sum()
+        outliers_lower = (data < lower_threshold).sum()
         total_outliers = outliers_upper + outliers_lower
 
         # Add outlier count
-        outlier_text = f'Outliers (Fredriksson):\nUpper (>6*std): {outliers_upper}\nLower (<-3.7*std): {outliers_lower}\nTotal: {total_outliers}'
+        outlier_text = f'Outliers ({method_label}):\nUpper (>{upper_mult:+.1f}*std): {outliers_upper}\nLower (<{lower_mult:+.1f}*std): {outliers_lower}\nTotal: {total_outliers}'
         ax.text(0.98, 0.98, outlier_text, transform=ax.transAxes,
                 fontsize=9, verticalalignment='top', horizontalalignment='right',
                 bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7))
@@ -1874,20 +2101,20 @@ def plot_distributions(df, zone, plots_dir='plots'):
     plt.tight_layout()
 
     # Save to plots directory
-    filepath = os.path.join(plots_dir, f'raw_distributions_{zone}.png')
+    filepath = os.path.join(plots_dir, f'{stage}_distributions_{zone}.png')
     plt.savefig(filepath, dpi=300, bbox_inches='tight')
     print(f"  Saved: {filepath}")
-    plt.show()
     plt.close()
 
 
-def plot_boxplots(df, zone, plots_dir='plots'):
+def plot_boxplots(df, zone, stage='raw', plots_dir='plots'):
     """Create box plots to visualize outliers."""
 
     print("\n--- Creating Box Plots ---")
 
     fig, axes = plt.subplots(1, 5, figsize=(20, 6))
-    fig.suptitle(f'Box Plots for Outlier Detection - {zone} (Raw Data)', fontsize=16, fontweight='bold')
+    stage_title = stage.replace('_', ' ').title()
+    fig.suptitle(f'Box Plots for Outlier Detection - {zone} ({stage_title} Data)', fontsize=16, fontweight='bold')
 
     variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']
     colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6']
@@ -1924,26 +2151,45 @@ def plot_boxplots(df, zone, plots_dir='plots'):
     plt.tight_layout()
 
     # Save to plots directory
-    filepath = os.path.join(plots_dir, f'raw_boxplots_{zone}.png')
+    filepath = os.path.join(plots_dir, f'{stage}_boxplots_{zone}.png')
     plt.savefig(filepath, dpi=300, bbox_inches='tight')
     print(f"  Saved: {filepath}")
-    plt.show()
     plt.close()
 
 
-def detect_outliers_fredriksson(df, zone, plots_dir='plots'):
+def detect_outliers(df, zone, method='fredriksson', plots_dir='plots'):
     """
-    Detect outliers using Fredriksson (2016) methodology.
+    Detect outliers using specified methodology.
 
-    Outlier definition:
-    - Exceeds 6x standard deviation above the mean, OR
-    - Lower than 3.7x standard deviation below the mean
+    Parameters:
+    - df: DataFrame with variables to check
+    - zone: Region name (for reporting)
+    - method: 'fredriksson' or 'gianfreda'
+    - plots_dir: Directory for saving results
+
+    Fredriksson (2016):
+    - Upper: +6σ, Lower: -3.7σ (asymmetric)
+
+    Gianfreda (2010) / Mugele et al. (2005):
+    - Upper: +3σ, Lower: -3σ (symmetric)
     """
 
-    print("\n" + "="*80)
-    print(f"OUTLIER DETECTION - FREDRIKSSON (2016) METHODOLOGY - {zone}")
-    print("="*80)
-    print("Definition: Outliers exceed 6*std above mean OR fall below -3.7*std below mean\n")
+    if method == 'fredriksson':
+        print("\n" + "="*80)
+        print(f"OUTLIER DETECTION - FREDRIKSSON (2016) METHODOLOGY - {zone}")
+        print("="*80)
+        print("Definition: Outliers exceed +6*std above mean OR fall below -3.7*std below mean\n")
+        upper_multiplier = 6.0
+        lower_multiplier = -3.7
+    elif method == 'gianfreda':
+        print("\n" + "="*80)
+        print(f"OUTLIER DETECTION - GIANFREDA (2010) / MUGELE ET AL. (2005) METHODOLOGY - {zone}")
+        print("="*80)
+        print("Definition: Outliers exceed ±3*std (symmetric threshold)\n")
+        upper_multiplier = 3.0
+        lower_multiplier = -3.0
+    else:
+        raise ValueError(f"Unknown method: {method}. Choose 'fredriksson' or 'gianfreda'.")
 
     variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']
 
@@ -1954,9 +2200,9 @@ def detect_outliers_fredriksson(df, zone, plots_dir='plots'):
         mean_val = data.mean()
         std_val = data.std()
 
-        # Fredriksson thresholds
-        upper_threshold = mean_val + 6 * std_val
-        lower_threshold = mean_val - 3.7 * std_val
+        # Calculate thresholds based on method
+        upper_threshold = mean_val + upper_multiplier * std_val
+        lower_threshold = mean_val + lower_multiplier * std_val
 
         # Identify outliers
         outliers_upper = data > upper_threshold
@@ -1972,8 +2218,8 @@ def detect_outliers_fredriksson(df, zone, plots_dir='plots'):
         print(f"\n{var}:")
         print(f"  Mean: {mean_val:.2f}")
         print(f"  Std Dev: {std_val:.2f}")
-        print(f"  Upper threshold (+6*std): {upper_threshold:.2f}")
-        print(f"  Lower threshold (-3.7*std): {lower_threshold:.2f}")
+        print(f"  Upper threshold ({upper_multiplier:+.1f}*std): {upper_threshold:.2f}")
+        print(f"  Lower threshold ({lower_multiplier:+.1f}*std): {lower_threshold:.2f}")
         print(f"  Outliers above threshold: {n_outliers_upper}")
         print(f"  Outliers below threshold: {n_outliers_lower}")
         print(f"  Total outliers: {n_outliers_total} ({pct_outliers:.2f}% of data)")
@@ -1988,6 +2234,8 @@ def detect_outliers_fredriksson(df, zone, plots_dir='plots'):
             'Std': std_val,
             'Upper_Threshold': upper_threshold,
             'Lower_Threshold': lower_threshold,
+            'Upper_Multiplier': upper_multiplier,
+            'Lower_Multiplier': lower_multiplier,
             'N_Outliers_Upper': n_outliers_upper,
             'N_Outliers_Lower': n_outliers_lower,
             'N_Outliers_Total': n_outliers_total,
@@ -1997,13 +2245,26 @@ def detect_outliers_fredriksson(df, zone, plots_dir='plots'):
     return pd.DataFrame(outlier_summary)
 
 
-def plot_outliers_timeline(df, zone, plots_dir='plots'):
+def plot_outliers_timeline(df, zone, method='fredriksson', stage='raw', plots_dir='plots'):
     """Plot time series highlighting detected outliers."""
 
     print("\n--- Creating Outlier Timeline Visualization ---")
 
+    # Set thresholds based on method
+    if method == 'fredriksson':
+        upper_mult = 6.0
+        lower_mult = -3.7
+        method_label = 'Fredriksson'
+    elif method == 'gianfreda':
+        upper_mult = 3.0
+        lower_mult = -3.0
+        method_label = 'Gianfreda'
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
     fig, axes = plt.subplots(5, 1, figsize=(16, 20))
-    fig.suptitle(f'Time Series with Detected Outliers - {zone} (Fredriksson Methodology)',
+    stage_title = stage.replace('_', ' ').title()
+    fig.suptitle(f'Time Series with Detected Outliers - {zone} ({method_label} Methodology, {stage_title})',
                  fontsize=16, fontweight='bold')
 
     variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']
@@ -2017,8 +2278,8 @@ def plot_outliers_timeline(df, zone, plots_dir='plots'):
         # Calculate thresholds
         mean_val = data.mean()
         std_val = data.std()
-        upper_threshold = mean_val + 6 * std_val
-        lower_threshold = mean_val - 3.7 * std_val
+        upper_threshold = mean_val + upper_mult * std_val
+        lower_threshold = mean_val + lower_mult * std_val
 
         # Identify outliers
         outliers = (data > upper_threshold) | (data < lower_threshold)
@@ -2032,9 +2293,9 @@ def plot_outliers_timeline(df, zone, plots_dir='plots'):
 
         # Add threshold lines
         ax.axhline(upper_threshold, color='orange', linestyle='--',
-                  linewidth=1.5, label=f'+6*std: {upper_threshold:.2f}')
+                  linewidth=1.5, label=f'{upper_mult:+.1f}*std: {upper_threshold:.2f}')
         ax.axhline(lower_threshold, color='orange', linestyle='--',
-                  linewidth=1.5, label=f'-3.7*std: {lower_threshold:.2f}')
+                  linewidth=1.5, label=f'{lower_mult:+.1f}*std: {lower_threshold:.2f}')
         ax.axhline(mean_val, color='green', linestyle='-',
                   linewidth=1, alpha=0.5, label=f'Mean: {mean_val:.2f}')
 
@@ -2047,14 +2308,13 @@ def plot_outliers_timeline(df, zone, plots_dir='plots'):
     plt.tight_layout()
 
     # Save to plots directory
-    filepath = os.path.join(plots_dir, f'raw_outliers_timeline_{zone}.png')
+    filepath = os.path.join(plots_dir, f'{stage}_outliers_timeline_{zone}.png')
     plt.savefig(filepath, dpi=300, bbox_inches='tight')
     print(f"  Saved: {filepath}")
-    plt.show()
     plt.close()
 
 
-def plot_scatter_matrix(df, zone, plots_dir='plots'):
+def plot_scatter_matrix(df, zone, stage='raw', plots_dir='plots'):
     """Create scatter plot matrix to see relationships between variables."""
 
     print("\n--- Creating Scatter Plot Matrix ---")
@@ -2080,29 +2340,40 @@ def plot_scatter_matrix(df, zone, plots_dir='plots'):
         ax.yaxis.label.set_rotation(0)
         ax.yaxis.label.set_ha('right')
 
-    plt.suptitle(f'Scatter Plot Matrix - Relationships Between Variables - {zone}',
+    stage_title = stage.replace('_', ' ').title()
+    plt.suptitle(f'Scatter Plot Matrix - Relationships Between Variables - {zone} ({stage_title})',
                  fontsize=16, fontweight='bold', y=0.995)
     plt.tight_layout()
 
     # Save to plots directory
-    filepath = os.path.join(plots_dir, f'raw_scatter_matrix_{zone}.png')
+    filepath = os.path.join(plots_dir, f'{stage}_scatter_matrix_{zone}.png')
     plt.savefig(filepath, dpi=300, bbox_inches='tight')
     print(f"  Saved: {filepath}")
-    plt.show()
     plt.close()
 
 
-def run_visualizations(data, zone, plots_dir='plots'):
-    """Run all visualization functions."""
+def run_visualizations(data, zone, method='fredriksson', stage='raw', plots_dir='plots'):
+    """
+    Run all visualization functions.
 
+    Parameters:
+    - data: DataFrame with variables to visualize
+    - zone: Region name (SE1, SE2, etc.)
+    - method: Outlier detection method ('fredriksson' or 'gianfreda')
+    - stage: Data transformation stage ('raw', 'logged', etc.)
+    - plots_dir: Base directory for plots (zone-specific subfolder will be created)
+    """
+
+    stage_title = stage.replace('_', ' ').title()
     print("\n" + "="*80)
-    print("RUNNING RAW DATA VISUALIZATIONS")
+    print(f"RUNNING {stage_title.upper()} DATA VISUALIZATIONS - {zone}")
     print("="*80)
 
-    # Create plots directory if it doesn't exist
-    if not os.path.exists(plots_dir):
-        os.makedirs(plots_dir)
-        print(f"\nCreated directory: {plots_dir}/")
+    # Create zone-specific subdirectory
+    zone_plots_dir = os.path.join(plots_dir, zone)
+    if not os.path.exists(zone_plots_dir):
+        os.makedirs(zone_plots_dir)
+        print(f"\nCreated directory: {zone_plots_dir}/")
 
     # Set style for better-looking plots
     sns.set_style("whitegrid")
@@ -2110,50 +2381,50 @@ def run_visualizations(data, zone, plots_dir='plots'):
 
     # Basic statistics
     print("\n" + "="*80)
-    print("DESCRIPTIVE STATISTICS (RAW DATA)")
+    print(f"DESCRIPTIVE STATISTICS ({stage_title.upper()} DATA)")
     print("="*80)
     print(data[['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']].describe())
 
-    # Detect outliers using Fredriksson methodology
-    outlier_summary = detect_outliers_fredriksson(data, zone, plots_dir)
+    # Detect outliers using specified methodology
+    outlier_summary = detect_outliers(data, zone, method=method, plots_dir=zone_plots_dir)
 
-    # Save outlier summary to CSV in plots directory
-    csv_path = os.path.join(plots_dir, f'outlier_summary_fredriksson_{zone}.csv')
+    # Save outlier summary to CSV in zone-specific plots directory
+    csv_path = os.path.join(zone_plots_dir, f'outlier_summary_{method}_{stage}_{zone}.csv')
     outlier_summary.to_csv(csv_path, index=False)
     print(f"\n  Saved outlier summary to: {csv_path}")
 
     # Create visualizations
     print("\n--- Generating Visualizations ---")
-    plot_time_series(data, zone, plots_dir)
-    plot_distributions(data, zone, plots_dir)
-    plot_boxplots(data, zone, plots_dir)
-    plot_outliers_timeline(data, zone, plots_dir)
-    plot_scatter_matrix(data, zone, plots_dir)
+    plot_time_series(data, zone, stage=stage, plots_dir=zone_plots_dir)
+    plot_distributions(data, zone, method=method, stage=stage, plots_dir=zone_plots_dir)
+    plot_boxplots(data, zone, stage=stage, plots_dir=zone_plots_dir)
+    plot_outliers_timeline(data, zone, method=method, stage=stage, plots_dir=zone_plots_dir)
+    plot_scatter_matrix(data, zone, stage=stage, plots_dir=zone_plots_dir)
 
     print("\n" + "="*80)
     print("VISUALIZATION COMPLETE!")
     print("="*80)
-    print(f"\nAll files saved to: {plots_dir}/")
+    print(f"\nAll files saved to: {zone_plots_dir}/")
     print("\nGenerated files:")
-    print(f"  1. raw_time_series_{zone}.png - Time series plots for all variables")
-    print(f"  2. raw_distributions_{zone}.png - Distribution histograms with outlier thresholds")
-    print(f"  3. raw_boxplots_{zone}.png - Box plots for outlier detection")
-    print(f"  4. raw_outliers_timeline_{zone}.png - Time series with outliers highlighted")
-    print(f"  5. raw_scatter_matrix_{zone}.png - Relationships between variables")
-    print(f"  6. outlier_summary_fredriksson_{zone}.csv - Outlier detection statistics")
+    print(f"  1. {stage}_time_series_{zone}.png - Time series plots for all variables")
+    print(f"  2. {stage}_distributions_{zone}.png - Distribution histograms with outlier thresholds")
+    print(f"  3. {stage}_boxplots_{zone}.png - Box plots for outlier detection")
+    print(f"  4. {stage}_outliers_timeline_{zone}.png - Time series with outliers highlighted")
+    print(f"  5. {stage}_scatter_matrix_{zone}.png - Relationships between variables")
+    print(f"  6. outlier_summary_{method}_{stage}_{zone}.csv - Outlier detection statistics")
 
 
 # --- 6. EXECUTION BLOCK ---
 
 if __name__ == "__main__":
     # --- CONFIGURATION ---
-    ACTIVE_ZONE = 'SE1'
+    ACTIVE_ZONE = 'SE3'
 
     # --- VISUALIZATION TOGGLE ---
     # Toggle for data visualization and outlier detection
     # When True: generates comprehensive visualizations of raw data and outlier detection
     # When False: skips visualization and proceeds directly to regression analysis
-    RUN_VISUALIZATIONS = False
+    RUN_VISUALIZATIONS = True
 
     # --- TRANSFORMATION TOGGLES (STANDARD APPROACH) ---
     # Toggle for logarithmic transformation (Fredriksson 2016 methodology)
@@ -2166,6 +2437,18 @@ if __name__ == "__main__":
     # When True: deseasonalizes the LOGGED variables using dummy variable regression
     # STANDARD APPROACH: Deseasonalization is applied to LOGGED series (after log transformation)
     USE_DESEASONALIZED = True
+
+    # --- NEGATIVE VALUE HANDLING ---
+    # Method for handling negative price values (before log transformation)
+    # 'clip': Replace values below 0.01 with 0.01 (current default, affects only negative/zero values)
+    # 'shift': Shift entire price series upward so minimum becomes 0.01 (preserves relative differences)
+    # Note: Net_Exchange is never modified (expected to have negative values)
+    NEGATIVE_PRICE_HANDLING = 'clip'  # Options: 'clip' or 'shift'
+
+    # --- PROGRESS TRACKING TOGGLE ---
+    # When True: displays progress bars for long-running operations (requires tqdm for best experience)
+    # When False: minimal output (current behavior)
+    SHOW_PROGRESS_BARS = True
 
     # --- OUTLIER HANDLING TOGGLES ---
     # Toggle for outlier replacement
@@ -2180,7 +2463,7 @@ if __name__ == "__main__":
     # 'gianfreda': Gianfreda (2010) / Mugele et al. (2005) methodology
     #   - Threshold: ±3σ (symmetric)
     #   - Replacement: Capped at ±3σ for respective weekday
-    OUTLIER_METHOD = 'gianfreda'  # Options: 'fredriksson' or 'gianfreda'
+    OUTLIER_METHOD = 'fredriksson'  # Options: 'fredriksson' or 'gianfreda'
 
     # METHODOLOGICAL NOTE:
     # Fredriksson (2016) applies outlier filter TWICE:
@@ -2206,7 +2489,7 @@ if __name__ == "__main__":
     # Commodity prices (oil & gas) are ALWAYS lagged by 24 hours (hardcoded in pipeline)
     # Rationale: Day-ahead electricity market uses commodity prices from bidding time (D-1)
     # This aligns with standard literature (Weron, Huisman, etc.)
-    LAG_COMMODITY_HOURS = 24  # Applied automatically in lag_commodity_prices()
+    LAG_COMMODITY_HOURS = 24  # Applied automatically in load_data()
 
     # --- DIAGNOSTIC TEST TOGGLES (Fredriksson 2016 methodology) ---
     # Toggle for Ljung-Box test for autocorrelation
@@ -2249,47 +2532,67 @@ if __name__ == "__main__":
     # When False: runs standard analysis
     RUN_QUANTILE_REGRESSION = False
 
-    # Updated paths matching your local project directory
-    # Master data files are stored in 'master data files/' folder
+    # Data file paths - dynamically set based on ACTIVE_ZONE
     PATHS = {
-        'price': 'master data files/Spot_Prices.xlsx',
-        'wind': 'master data files/Master_Wind_Forecast_Merged_2021_2024.xlsx',
+        'combined': f'master data files/2015-2025/Combined_{ACTIVE_ZONE}_Data_2015_2025.xlsx',
         'hydro': 'master data files/Master_Hydro_Reservoir.xlsx',
-        'exch': 'master data files/Master_Exchange_Merged_2021_2024.xlsx',
-        'cons': 'master data files/Master_Consumption_2021_2024.xlsx',
         'commodities': 'master data files/Master_Commodities.xlsx'
     }
 
     try:
-        # Load and clean full dataset
-        data = load_all_thesis_data(PATHS, zone_price=ACTIVE_ZONE, use_interpolation=USE_LINEAR_INTERPOLATION)
+        # Load and clean full dataset (filtered to 2021-2024 for hydro/commodity availability)
+        # Note: Commodity prices are automatically lagged within load_data()
+        data = load_data(
+            PATHS,
+            target_region=ACTIVE_ZONE,
+            zone_hydro=ACTIVE_ZONE,
+            use_interpolation=USE_LINEAR_INTERPOLATION,
+            start_date='2015-01-01',
+            end_date='2025-12-31',
+            lag_commodity_hours=LAG_COMMODITY_HOURS
+        )
         print(f"Merge successful. Total hourly observations: {len(data)}")
 
-        # --- STEP 0: LAG COMMODITY PRICES (day-ahead market alignment) ---
-        # Apply 24-hour lag to oil and gas prices to reflect information set at bidding time
-        # Standard practice in electricity price modeling: commodity prices at time t should be
-        # from t-24 (when day-ahead auction occurred), not from time t (delivery time)
-        data = lag_commodity_prices(data, lag_hours=LAG_COMMODITY_HOURS)
-
         # --- STEP 1: VISUALIZATION OF RAW DATA (if enabled) ---
+        # Visualize pure, untouched raw data BEFORE any transformations
+        # This shows the true state of the data including any negative values or quality issues
         if RUN_VISUALIZATIONS:
-            run_visualizations(data, ACTIVE_ZONE)
+            run_visualizations(data, ACTIVE_ZONE, method=OUTLIER_METHOD, stage='raw')
 
-        # --- STEP 2: LOG TRANSFORMATION (if enabled) ---
+        # --- STEP 2: CHECK NEGATIVE VALUES & HANDLE PRICE ---
+        # Check all variables for negative values and handle Price if needed
+        # Net_Exchange is NOT checked or modified (expected to have negative values)
+        # NOTE: This happens AFTER raw visualization so we can see the original data quality issues
+        data = handle_negative_prices(data, method=NEGATIVE_PRICE_HANDLING)
+
+        # --- STEP 3: LOG TRANSFORMATION (if enabled) ---
         # STANDARD APPROACH: Apply log transformation FIRST, before deseasonalization
         # This is the standard econometric approach for handling multiplicative seasonality
         # Note: Commodity prices are already lagged at this point
+        # Note: Price negative values handled in STEP 2 (before log transformation)
         if USE_LOG_TRANSFORM:
             data = apply_log_transform(data)
 
-        # --- STEP 3: DESEASONALIZATION (if enabled) ---
+            # Visualize logged data (if enabled)
+            # This shows data AFTER negative handling and log transformation
+            if RUN_VISUALIZATIONS:
+                # Create temporary dataframe with logged variables mapped to base names for visualization
+                data_logged_viz = data.copy()
+                data_logged_viz['Price'] = data_logged_viz['Price_Log']
+                data_logged_viz['Wind_Forecast'] = data_logged_viz['Wind_Forecast_Log']
+                data_logged_viz['Hydro_Reserves'] = data_logged_viz['Hydro_Reserves_Log']
+                data_logged_viz['Consumption'] = data_logged_viz['Consumption_Log']
+                # Net_Exchange stays the same (not logged)
+                run_visualizations(data_logged_viz, ACTIVE_ZONE, method=OUTLIER_METHOD, stage='logged')
+
+        # --- STEP 4: DESEASONALIZATION (if enabled) ---
         # STANDARD APPROACH: Deseasonalize the LOGGED variables (after log transformation)
         # Price & Consumption: Year + Month + DOW + Hour + Holiday (FULL deseasonalization)
         # Hydro, Oil, Gas: Year + Month ONLY (PARTIAL - no intraday patterns)
         if USE_DESEASONALIZED:
             data = deseasonalize_logged_variables(data)
 
-        # --- STEP 4: OUTLIER HANDLING (if enabled) ---
+        # --- STEP 5: OUTLIER HANDLING (if enabled) ---
         # Apply outlier handling to logged-deseasonalized series (if both transformations enabled)
         # This provides the most meaningful outlier detection:
         #   - Log transformation stabilizes variance
@@ -2307,10 +2610,11 @@ if __name__ == "__main__":
             else:
                 raise ValueError(f"Unknown outlier method: {OUTLIER_METHOD}. Choose 'fredriksson' or 'gianfreda'.")
 
-        # --- STEP 5: REGRESSION ANALYSIS ---
+        # --- STEP 6: REGRESSION ANALYSIS ---
         # Run regression models with optional diagnostic tests
-        # Commodity prices used in regression are lagged by 24h (from Step 0)
+        # Commodity prices used in regression are lagged by 24h (from load_data)
         perform_multivariate_analysis(data, ACTIVE_ZONE,
+                                      target_region=ACTIVE_ZONE,
                                       use_log_transform=USE_LOG_TRANSFORM,
                                       use_deseasonalized=USE_DESEASONALIZED,
                                       run_ljungbox=RUN_LJUNGBOX_TEST,
@@ -2322,7 +2626,8 @@ if __name__ == "__main__":
                                       rolling_window_years=ROLLING_WINDOW_YEARS,
                                       rolling_step_years=ROLLING_STEP_YEARS,
                                       rolling_min_obs=ROLLING_MIN_OBS,
-                                      run_quantile_regression=RUN_QUANTILE_REGRESSION)
+                                      run_quantile_regression=RUN_QUANTILE_REGRESSION,
+                                      show_progress=SHOW_PROGRESS_BARS)
 
     except Exception as e:
         print(f"Critical error during execution: {e}")

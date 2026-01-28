@@ -276,20 +276,20 @@ Residuals from this regression = deseasonalized series
 
 ### Step 1: Load Data
 
-**Function**: `load_all_thesis_data()`
+**Function**: `load_data()`
 
 **Inputs**:
-- `Spot_Prices.xlsx`
-- `Master_Wind_Forecast_Merged_2021_2024.xlsx`
-- `Master_Hydro_Reservoir.xlsx`
-- `Master_Exchange_Merged_2021_2024.xlsx`
-- `Master_Consumption_2021_2024.xlsx`
+- `Combined_SE1_Data_2015_2025.xlsx` (contains Price, Wind, Exchange, Consumption)
+- `Master_Hydro_Reservoir.xlsx` (SE1 hydro reserves)
+- `Master_Commodities.xlsx` (Brent Oil, TTF Gas prices)
 
 **Process**:
-1. Load each file
-2. Merge on `Timestamp` (hourly)
-3. Select zone-specific columns (SE1)
-4. Create datetime index
+1. Load combined SE1 data (2015-2025 range)
+2. Merge hydro reserves on Timestamp
+3. Merge daily commodity prices on Date
+4. Filter to 2021-2024 (matches hydro/commodity availability)
+5. Handle missing values (interpolate or drop)
+6. Return DataFrame indexed by Datetime
 
 **Output**: DataFrame with hourly observations for all variables
 

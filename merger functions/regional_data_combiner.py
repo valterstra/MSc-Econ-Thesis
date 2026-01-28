@@ -4,19 +4,35 @@ import pytz
 
 # --- 1. CONFIGURATION ---
 # Change this to 'SE1', 'SE2', 'SE3', or 'SE4' to switch regions
-target_region = 'SE4'
+target_region = 'SE1'
 
 # Extract region number (e.g., '1' from 'SE1')
 region_number = target_region[-1]
 
-# File paths for input data
-spot_price_file = 'master data files/2015-2025/Spot_Prices_2015_2025.xlsx'
-wind_forecast_file = f'Verified_S{region_number}_Wind_Forecast_2015_2025.xlsx'
-exchange_file = f'Verified_{target_region}_Exchange_2015_2025.xlsx'
-consumption_file = 'Master_Consumption_2015_2025.xlsx'
+# Congestion threshold (Sandberg uses 1 öre; prices are in EUR/MWh)
+CONGESTION_EPSILON_EUR = 0.01
+
+# Define trading partners for each region (based on direct transmission connections)
+TRADING_PARTNERS = {
+    'SE1': ['FI', 'NO4', 'SE2'],
+    'SE2': ['NO3', 'NO4', 'SE1', 'SE3'],
+    'SE3': ['DK1', 'FI', 'NO1', 'SE2', 'SE4'],
+    'SE4': []   # To be defined later
+}
+
+# Get script directory for absolute paths
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.join(script_dir, '..')
+
+# File paths for input data (absolute paths based on script location)
+spot_price_file = os.path.join(project_root, 'master data files', '2015-2025', 'Spot_Prices_2015_2025.xlsx')
+wind_forecast_file = os.path.join(project_root, f'Verified_S{region_number}_Wind_Forecast_2015_2025.xlsx')
+exchange_file = os.path.join(project_root, f'Verified_{target_region}_Exchange_2015_2025.xlsx')
+consumption_file = os.path.join(project_root, 'Master_Consumption_2015_2025.xlsx')
+hydro_file = os.path.join(project_root, 'master data files', 'Master_Hydro_Reservoir.xlsx')
 
 # Output file
-output_file = f'master data files/2015-2025/Combined_{target_region}_Data_2015_2025.xlsx'
+output_file = os.path.join(project_root, 'master data files', '2015-2025', f'Combined_{target_region}_Data_2015_2025.xlsx')
 
 print(f"=" * 60)
 print(f"  COMBINING DATA FOR {target_region}")
@@ -32,20 +48,68 @@ ground_truth_df = pd.DataFrame({'Timestamp': gt_range.tz_localize(None)})
 ground_truth_df['Occurrence'] = ground_truth_df.groupby('Timestamp').cumcount()
 print(f"Ground truth created: {len(ground_truth_df)} hours expected")
 
-# --- 3. LOAD ALL DATA FILES ---
+# --- 3. LOAD ALL DATA FILES & CREATE DUMMIES ---
 print("\nLoading data files...")
 
-# Load Spot Prices (2015-2025)
+# Load Spot Prices (2015-2025) - keep all price columns for bottleneck calculation
 print(f"  Loading spot prices...")
-spot_df = pd.read_excel(spot_price_file)
-spot_df['Timestamp'] = pd.to_datetime(spot_df['Timestamp'])
-# Extract only the relevant region's price column
-price_column = f'{target_region}_Price (EUR)'
-spot_df = spot_df[['Timestamp', price_column]].copy()
-spot_df.rename(columns={price_column: 'Spot_Price'}, inplace=True)
+spot_df_full = pd.read_excel(spot_price_file)
+spot_df_full['Timestamp'] = pd.to_datetime(spot_df_full['Timestamp'])
+
+# Identify all price columns
+price_columns = [col for col in spot_df_full.columns if col.endswith('_Price (EUR)')]
+
+# Keep Timestamp and all price columns
+spot_df = spot_df_full[['Timestamp'] + price_columns].copy()
+
+# Create Spot_Price column for target region
+target_price_col = f'{target_region}_Price (EUR)'
+if target_price_col not in spot_df.columns:
+    raise ValueError(f"Price column {target_price_col} not found in spot price data!")
+spot_df['Spot_Price'] = spot_df[target_price_col]
+
 # Add Occurrence for DST handling
 spot_df['Occurrence'] = spot_df.groupby('Timestamp').cumcount()
-print(f"    Loaded {len(spot_df)} rows")
+print(f"    Loaded {len(spot_df)} rows with {len(price_columns)} price areas")
+
+# --- 3b. CREATE BOTTLENECK DUMMIES ---
+print(f"\n  Creating {target_region} bottleneck dummies (EPSILON = {CONGESTION_EPSILON_EUR} EUR/MWh)...")
+
+# Get trading partners for the target region
+trading_partners = TRADING_PARTNERS.get(target_region, [])
+
+if not trading_partners:
+    print(f"    WARNING: No trading partners defined for {target_region}, skipping bottleneck dummies...")
+    bneck_cols = []
+else:
+    bneck_cols = []
+
+    for other_area in trading_partners:
+        # Construct the price column name
+        other_col = f'{other_area}_Price (EUR)'
+
+        # Skip if the price column doesn't exist in the data
+        if other_col not in price_columns:
+            print(f"    WARNING: {other_col} not found in spot price data, skipping...")
+            continue
+
+        # Create dummy name
+        dummy_name = f'BNECK_{target_region}_{other_area}'
+
+        # Calculate price difference
+        price_diff = (spot_df['Spot_Price'] - spot_df[other_col]).abs()
+
+        # Create dummy: 1 if |diff| > EPSILON, 0 otherwise
+        # Preserve NaN if either price is NaN
+        dummy = (price_diff > CONGESTION_EPSILON_EUR).astype(float)
+        dummy = dummy.where(spot_df['Spot_Price'].notna() & spot_df[other_col].notna(), pd.NA)
+
+        spot_df[dummy_name] = dummy
+        bneck_cols.append(dummy_name)
+
+    print(f"    Created {len(bneck_cols)} bottleneck dummies for {target_region}'s trading partners:")
+    for col in bneck_cols:
+        print(f"      {col}")
 
 # Load Wind Forecast (2015-2025)
 print(f"  Loading wind forecast for S{region_number}...")
@@ -79,6 +143,17 @@ consumption_df.rename(columns={target_region: 'Consumption_Forecast'}, inplace=T
 consumption_df['Occurrence'] = consumption_df.groupby('Timestamp').cumcount()
 print(f"    Loaded {len(consumption_df)} rows")
 
+# Load Hydro Reserves (2015-2025)
+print(f"  Loading hydro reserves for {target_region}...")
+hydro_df = pd.read_excel(hydro_file)
+hydro_df['Timestamp'] = pd.to_datetime(hydro_df['Timestamp'])
+hydro_column = f'{target_region}_Hydro_Reserves'
+hydro_df = hydro_df[['Timestamp', hydro_column]].copy()
+hydro_df.rename(columns={hydro_column: 'Hydro_Reserves'}, inplace=True)
+# Add Occurrence for DST handling
+hydro_df['Occurrence'] = hydro_df.groupby('Timestamp').cumcount()
+print(f"    Loaded {len(hydro_df)} rows")
+
 # --- 4. MERGE ALL DATA INTO GROUND TRUTH ---
 print("\nMerging datasets into ground truth template...")
 
@@ -86,12 +161,22 @@ print("\nMerging datasets into ground truth template...")
 combined_df = ground_truth_df.copy()
 
 # Merge each dataset and track missing values
+# Build datasets list: start with Spot_Price, then bottleneck dummies, then other variables
 datasets = [
-    ('Spot_Price', spot_df, 'Spot_Price'),
+    ('Spot_Price', spot_df, 'Spot_Price')
+]
+
+# Add bottleneck dummy datasets
+for dummy_col in bneck_cols:
+    datasets.append((dummy_col, spot_df, dummy_col))
+
+# Add remaining variables
+datasets.extend([
     ('Wind_Forecast', wind_df, 'Wind_Forecast'),
     ('Net_Exchange', exchange_df, 'Net_Exchange'),
-    ('Consumption_Forecast', consumption_df, 'Consumption_Forecast')
-]
+    ('Consumption_Forecast', consumption_df, 'Consumption_Forecast'),
+    ('Hydro_Reserves', hydro_df, 'Hydro_Reserves')
+])
 
 missing_report = {}
 
@@ -154,8 +239,8 @@ for name, info in missing_report.items():
             print(f"    {ts}")
 
 # --- 6. REORDER COLUMNS ---
-# Put columns in logical order: Timestamp, Spot Price, Wind, Exchange, Consumption
-column_order = ['Timestamp', 'Spot_Price', 'Wind_Forecast', 'Net_Exchange', 'Consumption_Forecast']
+# Put columns in logical order: Timestamp, Spot_Price, bottleneck dummies, then other variables
+column_order = ['Timestamp', 'Spot_Price'] + bneck_cols + ['Wind_Forecast', 'Net_Exchange', 'Consumption_Forecast', 'Hydro_Reserves']
 combined_df = combined_df[column_order]
 
 # --- 7. SAVE OUTPUT ---
