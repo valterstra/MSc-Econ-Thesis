@@ -4,7 +4,7 @@ import pytz
 
 # --- 1. CONFIGURATION ---
 # Change this to 'SE1', 'SE2', 'SE3', or 'SE4' to switch regions
-target_region = 'SE1'
+target_region = 'SE4'
 
 # Extract region number (e.g., '1' from 'SE1')
 region_number = target_region[-1]
@@ -17,7 +17,7 @@ TRADING_PARTNERS = {
     'SE1': ['FI', 'NO4', 'SE2'],
     'SE2': ['NO3', 'NO4', 'SE1', 'SE3'],
     'SE3': ['DK1', 'FI', 'NO1', 'SE2', 'SE4'],
-    'SE4': []   # To be defined later
+    'SE4': ['DK2', 'SE3']
 }
 
 # Get script directory for absolute paths

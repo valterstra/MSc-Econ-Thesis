@@ -901,7 +901,7 @@ def apply_log_transform(df):
 
 # --- 3. DIAGNOSTIC TEST FUNCTIONS ---
 
-def run_ljungbox_test(residuals, lags=[5, 10, 15, 20]):
+def run_ljungbox_test(residuals, lags=[5, 10, 15, 20], return_results=False, print_output=True):
     """
     Ljung-Box test for autocorrelation in residuals.
 
@@ -909,23 +909,50 @@ def run_ljungbox_test(residuals, lags=[5, 10, 15, 20]):
     Low p-values (< 0.05) indicate significant autocorrelation.
 
     Following Fredriksson (2016), tests at multiple lag lengths.
+
+    Parameters:
+    - residuals: Residual series to test
+    - lags: List of lag values to test
+    - return_results: If True, return DataFrame with results
+    - print_output: If True, print formatted table (default behavior)
+
+    Returns:
+    - If return_results=True: DataFrame with columns [lag, test_stat, p_value, reject_h0]
+    - If return_results=False: None (backward compatible)
     """
-    print("\n--- LJUNG-BOX TEST FOR AUTOCORRELATION ---")
-    print("H0: Residuals are independently distributed (no autocorrelation)")
-    print("Reject H0 if p-value < 0.05\n")
+    if print_output:
+        print("\n--- LJUNG-BOX TEST FOR AUTOCORRELATION ---")
+        print("H0: Residuals are independently distributed (no autocorrelation)")
+        print("Reject H0 if p-value < 0.05\n")
 
     # Run test at multiple lags
     lb_results = acorr_ljungbox(residuals, lags=lags, return_df=True)
 
-    print(f"{'Lag':<10} {'Test Statistic':<20} {'P-value':<15} {'Result'}")
-    print("-" * 60)
+    if print_output:
+        print(f"{'Lag':<10} {'Test Statistic':<20} {'P-value':<15} {'Result'}")
+        print("-" * 60)
 
+    results_data = []
     for lag in lags:
         if lag in lb_results.index:
             stat = lb_results.loc[lag, 'lb_stat']
             pval = lb_results.loc[lag, 'lb_pvalue']
-            result = "REJECT H0 (autocorr present)" if pval < 0.05 else "Fail to reject H0"
-            print(f"{lag:<10} {stat:<20.4f} {pval:<15.4f} {result}")
+            reject_h0 = pval < 0.05
+
+            if print_output:
+                result = "REJECT H0 (autocorr present)" if reject_h0 else "Fail to reject H0"
+                print(f"{lag:<10} {stat:<20.4f} {pval:<15.4f} {result}")
+
+            results_data.append({
+                'lag': lag,
+                'test_stat': stat,
+                'p_value': pval,
+                'reject_h0': reject_h0
+            })
+
+    if return_results:
+        return pd.DataFrame(results_data)
+    return None
 
 
 def run_heteroskedasticity_tests(residuals, nlags=10):
@@ -1251,8 +1278,10 @@ def run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, use_log_transform=True,
 
     plt.tight_layout()
 
-    # Save plot
-    plot_path = os.path.join(plots_dir, f'tvp_beta_wind_{zone}.png')
+    # Save plot to zone-specific subfolder
+    zone_plots_dir = os.path.join(plots_dir, zone)
+    os.makedirs(zone_plots_dir, exist_ok=True)
+    plot_path = os.path.join(zone_plots_dir, f'tvp_beta_wind_{zone}.png')
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     print(f"  Saved: {plot_path}")
     plt.close()
@@ -1315,59 +1344,59 @@ def run_rolling_window_analysis(df, zone, Y, exog_vars, use_log_transform,
     end_of_data = tmp.index.max()
 
     # Count total windows for progress tracking
+    # Window boundary logic: start + window_years gives the exclusive end boundary
+    # e.g., 2015-01-01 + 3 years = 2018-01-01, so data selected is 2015-01-01 to 2017-12-31
     total_windows = 0
     temp_start = start_date
-    while True:
+    while temp_start <= end_of_data:
         temp_end = temp_start + relativedelta(years=window_years)
-        if temp_end > end_of_data:
-            break
         temp_window = tmp[(tmp.index >= temp_start) & (tmp.index < temp_end)]
         if len(temp_window) >= min_obs:
             total_windows += 1
         temp_start = temp_start + relativedelta(years=step_years)
 
     print(f"\n--- Estimating Rolling Windows ---")
-    print(f"Total windows to estimate: {total_windows}")
+    print(f"Total windows to estimate: {total_windows}\n")
 
     window_count = 0
-    pbar = create_progress_bar(total=total_windows, desc="Rolling window estimation", disable=not show_progress)
+    current_start = start_date
 
-    with pbar:
-        while True:
-            window_end = start_date + relativedelta(years=window_years)
-            if window_end > end_of_data:
-                break
+    while current_start <= end_of_data:
+        window_end = current_start + relativedelta(years=window_years)
+        # Select data: [current_start, window_end) - window_end is exclusive boundary
+        window_data = tmp[(tmp.index >= current_start) & (tmp.index < window_end)]
 
-            window_data = tmp[(tmp.index >= start_date) & (tmp.index < window_end)]
+        if len(window_data) >= min_obs:
+            window_count += 1
+            # Display actual data range in this window
+            actual_start_year = window_data.index.min().year
+            actual_end_year = window_data.index.max().year
+            print(f"[{window_count}/{total_windows}] Window {actual_start_year} to {actual_end_year}... ", end="")
 
-            if len(window_data) >= min_obs:
-                window_count += 1
-                pbar.set_description(f"Window {window_count}/{total_windows}: {start_date.strftime('%Y-%m')}")
+            # Run OLS regression with Newey-West (HAC) standard errors
+            X = sm.add_constant(window_data[exog_vars])
+            y = window_data[Y.name]
+            model = sm.OLS(y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 24})
 
-                # Run OLS regression with Newey-West (HAC) standard errors
-                X = sm.add_constant(window_data[exog_vars])
-                y = window_data[Y.name]
-                model = sm.OLS(y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 24})
+            # Calculate window midpoint
+            window_midpoint = current_start + relativedelta(months=window_years * 6)
 
-                # Calculate window midpoint
-                window_midpoint = start_date + relativedelta(months=window_years * 6)
+            # Record results (use actual data boundaries for clarity)
+            results.append({
+                'window_start': current_start,
+                'window_end': window_data.index.max(),  # Actual last timestamp in window
+                'window_midpoint': window_midpoint,
+                'beta_wind': model.params[wind_col],
+                'se_wind': model.bse[wind_col],
+                't_stat': model.tvalues[wind_col],
+                'pvalue': model.pvalues[wind_col],
+                'n_obs': len(window_data),
+                'r_squared': model.rsquared
+            })
 
-                # Record results
-                results.append({
-                    'window_start': start_date,
-                    'window_end': window_end,
-                    'window_midpoint': window_midpoint,
-                    'beta_wind': model.params[wind_col],
-                    'se_wind': model.bse[wind_col],
-                    't_stat': model.tvalues[wind_col],
-                    'pvalue': model.pvalues[wind_col],
-                    'n_obs': len(window_data),
-                    'r_squared': model.rsquared
-                })
+            print(f"β_wind={model.params[wind_col]:.4f}, p={model.pvalues[wind_col]:.4f}")
 
-                pbar.update(1)
-
-            start_date = start_date + relativedelta(years=step_years)
+        current_start = current_start + relativedelta(years=step_years)
 
     if not results:
         print("\nWARNING: No valid windows found. Check data range and window parameters.")
@@ -1447,8 +1476,10 @@ def run_rolling_window_analysis(df, zone, Y, exog_vars, use_log_transform,
 
     plt.tight_layout()
 
-    # Save plot
-    plot_path = os.path.join(plots_dir, f'rolling_wind_coef_{zone}.png')
+    # Save plot to zone-specific subfolder
+    zone_plots_dir = os.path.join(plots_dir, zone)
+    os.makedirs(zone_plots_dir, exist_ok=True)
+    plot_path = os.path.join(zone_plots_dir, f'rolling_wind_coef_{zone}.png')
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     print(f"Saved plot to: {plot_path}")
     plt.close()
@@ -1609,43 +1640,42 @@ def run_quantile_regression_analysis(df, zone, use_log_transform,
     # TODO: Block bootstrap can be added later for time-series-robust inference
 
     results = []
-    pbar = create_progress_bar(total=len(QUANTILES), desc="Quantile regression", disable=not show_progress)
+    print(f"\nEstimating quantile regressions for {len(QUANTILES)} quantiles...\n")
 
-    with pbar:
-        for q in QUANTILES:
-            pbar.set_description(f"Quantile q={q:.2f}")
+    for idx, q in enumerate(QUANTILES, 1):
+        print(f"[{idx}/{len(QUANTILES)}] Quantile q={q:.2f}... ", end="")
 
-            model = sm.QuantReg(y, X)
-            res = model.fit(q=q)
+        model = sm.QuantReg(y, X)
+        res = model.fit(q=q)
 
-            # Extract coefficients for key variables
-            result_row = {
-                'quantile': q,
-                'beta_wind': res.params[wind_col],
-                'se_wind': res.bse[wind_col] if wind_col in res.bse.index else np.nan,
-                'p_wind': res.pvalues[wind_col] if wind_col in res.pvalues.index else np.nan,
-                'beta_demand': res.params[demand_col],
-                'se_demand': res.bse[demand_col] if demand_col in res.bse.index else np.nan,
-                'p_demand': res.pvalues[demand_col] if demand_col in res.pvalues.index else np.nan,
-                'beta_hydro': res.params[hydro_col],
-                'se_hydro': res.bse[hydro_col] if hydro_col in res.bse.index else np.nan,
-                'p_hydro': res.pvalues[hydro_col] if hydro_col in res.pvalues.index else np.nan,
-                'n_obs': int(res.nobs)
-            }
+        # Extract coefficients for key variables
+        result_row = {
+            'quantile': q,
+            'beta_wind': res.params[wind_col],
+            'se_wind': res.bse[wind_col] if wind_col in res.bse.index else np.nan,
+            'p_wind': res.pvalues[wind_col] if wind_col in res.pvalues.index else np.nan,
+            'beta_demand': res.params[demand_col],
+            'se_demand': res.bse[demand_col] if demand_col in res.bse.index else np.nan,
+            'p_demand': res.pvalues[demand_col] if demand_col in res.pvalues.index else np.nan,
+            'beta_hydro': res.params[hydro_col],
+            'se_hydro': res.bse[hydro_col] if hydro_col in res.bse.index else np.nan,
+            'p_hydro': res.pvalues[hydro_col] if hydro_col in res.pvalues.index else np.nan,
+            'n_obs': int(res.nobs)
+        }
 
-            # Add oil/gas if available
-            if oil_col and oil_col in res.params.index:
-                result_row['beta_oil'] = res.params[oil_col]
-                result_row['se_oil'] = res.bse[oil_col] if oil_col in res.bse.index else np.nan
-                result_row['p_oil'] = res.pvalues[oil_col] if oil_col in res.pvalues.index else np.nan
+        # Add oil/gas if available
+        if oil_col and oil_col in res.params.index:
+            result_row['beta_oil'] = res.params[oil_col]
+            result_row['se_oil'] = res.bse[oil_col] if oil_col in res.bse.index else np.nan
+            result_row['p_oil'] = res.pvalues[oil_col] if oil_col in res.pvalues.index else np.nan
 
-            if gas_col and gas_col in res.params.index:
-                result_row['beta_gas'] = res.params[gas_col]
-                result_row['se_gas'] = res.bse[gas_col] if gas_col in res.bse.index else np.nan
-                result_row['p_gas'] = res.pvalues[gas_col] if gas_col in res.pvalues.index else np.nan
+        if gas_col and gas_col in res.params.index:
+            result_row['beta_gas'] = res.params[gas_col]
+            result_row['se_gas'] = res.bse[gas_col] if gas_col in res.bse.index else np.nan
+            result_row['p_gas'] = res.pvalues[gas_col] if gas_col in res.pvalues.index else np.nan
 
-            results.append(result_row)
-            pbar.update(1)
+        results.append(result_row)
+        print(f"β_wind={res.params[wind_col]:.4f}, p={res.pvalues[wind_col] if wind_col in res.pvalues.index else np.nan:.4f}")
 
     # Create results DataFrame
     results_df = pd.DataFrame(results)
@@ -1753,35 +1783,42 @@ def select_armax_lags_aic(Y, exog_vars, max_p=10, max_q=10, show_progress=True):
     """
     print("\n--- ARMAX LAG SELECTION VIA AIC MINIMIZATION ---")
     print(f"Testing AR lags (p): 1-{max_p}, MA lags (q): 1-{max_q}")
-    print("This may take several minutes...\n")
+    print("This may take several minutes...")
+    print("="*80)
 
     best_aic = np.inf
     best_order = None
     results_table = []
 
     total_iterations = max_p * max_q
-    pbar = create_progress_bar(total=total_iterations, desc="Testing ARMAX models", disable=not show_progress)
+    print(f"Models to test: {total_iterations}\n")
 
     import warnings
-    with pbar:
-        for p in range(1, max_p + 1):
-            for q in range(1, max_q + 1):
-                try:
-                    pbar.set_description(f"Testing ARMAX({p},{q})")
-                    with warnings.catch_warnings():
-                        warnings.filterwarnings('ignore')
-                        model = sm.tsa.ARIMA(Y, exog=exog_vars, order=(p, 0, q))
-                        fitted = model.fit()
-                        aic = fitted.aic
-                        results_table.append({'p': p, 'q': q, 'AIC': aic})
+    model_counter = 0
 
-                        if aic < best_aic:
-                            best_aic = aic
-                            best_order = (p, q)
-                except Exception as e:
-                    results_table.append({'p': p, 'q': q, 'AIC': np.nan})
-                finally:
-                    pbar.update(1)
+    for p in range(1, max_p + 1):
+        for q in range(1, max_q + 1):
+            model_counter += 1
+            print(f"[{model_counter}/{total_iterations}] Testing ARMAX({p},{q})...", end=" ")
+
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore')
+                    model = sm.tsa.ARIMA(Y, exog=exog_vars, order=(p, 0, q))
+                    fitted = model.fit()
+                    aic = fitted.aic
+                    results_table.append({'p': p, 'q': q, 'AIC': aic})
+
+                    if aic < best_aic:
+                        best_aic = aic
+                        best_order = (p, q)
+                        print(f"AIC={aic:.2f} *** NEW BEST ***")
+                    else:
+                        print(f"AIC={aic:.2f}")
+
+            except Exception as e:
+                results_table.append({'p': p, 'q': q, 'AIC': np.nan})
+                print(f"FAILED - {str(e)[:50]}")
 
     print(f"\n{'='*70}")
     print(f"OPTIMAL MODEL SELECTED: ARMAX{best_order} with AIC = {best_aic:.2f}")
@@ -1801,14 +1838,301 @@ def select_armax_lags_aic(Y, exog_vars, max_p=10, max_q=10, show_progress=True):
     return best_order
 
 
+def select_armax_lags_aic_checkpointed(Y, exog_vars, zone='SE1',
+                                        max_p=10, max_q=10,
+                                        checkpoint_file=None,
+                                        ljungbox_lags=[5, 10, 15, 20],
+                                        save_interval=1,
+                                        show_progress=True):
+    """
+    Automated lag selection with checkpointing and Ljung-Box diagnostics.
+
+    Tests all combinations of AR lags (p) and MA lags (q) from 1 to max values.
+    Saves incremental progress to allow resumption if interrupted.
+    Includes Ljung-Box autocorrelation diagnostics for each specification.
+
+    Parameters:
+    - Y: Dependent variable series
+    - exog_vars: DataFrame with exogenous variables
+    - zone: Zone identifier for checkpoint filename
+    - max_p: Maximum AR lag to test
+    - max_q: Maximum MA lag to test
+    - checkpoint_file: Path to checkpoint file (auto-generated if None)
+    - ljungbox_lags: Lags to test in Ljung-Box test
+    - save_interval: Save checkpoint every N models (default 1 = every model)
+    - show_progress: Show progress bar
+
+    Returns:
+    - best_order: Tuple (p, q) with lowest AIC among models that pass Ljung-Box
+    - checkpoint_df: DataFrame with all results
+    """
+    print("\n--- ARMAX LAG SELECTION WITH CHECKPOINTING & DIAGNOSTICS ---")
+    print(f"Testing AR lags (p): 1-{max_p}, MA lags (q): 1-{max_q}")
+    print(f"Ljung-Box test lags: {ljungbox_lags}")
+
+    # Set up checkpoint file
+    if checkpoint_file is None:
+        checkpoint_dir = 'results'
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_file = os.path.join(checkpoint_dir, f'armax_lag_selection_checkpoint_{zone}.csv')
+
+    print(f"Checkpoint file: {checkpoint_file}")
+
+    # Check for existing checkpoint and load if exists
+    if os.path.exists(checkpoint_file):
+        checkpoint_df = pd.read_csv(checkpoint_file)
+        completed_specs = set((int(row['p']), int(row['q']))
+                             for _, row in checkpoint_df.iterrows()
+                             if row['status'] in ['completed', 'failed'])
+        print(f"Resuming: Found {len(completed_specs)} already tested specifications")
+    else:
+        checkpoint_df = pd.DataFrame()
+        completed_specs = set()
+        print("Starting fresh (no existing checkpoint found)")
+
+    print("\nThis may take several minutes...")
+    print("="*80)
+
+    # Count models to test
+    total_iterations = max_p * max_q
+    completed_count = len(completed_specs)
+    remaining = total_iterations - completed_count
+    print(f"Models to test: {remaining} (Total: {total_iterations}, Already completed: {completed_count})\n")
+
+    import warnings
+    model_counter = completed_count
+
+    for p in range(1, max_p + 1):
+        for q in range(1, max_q + 1):
+            # Skip if already tested
+            if (p, q) in completed_specs:
+                continue
+
+            model_counter += 1
+            print(f"[{model_counter}/{total_iterations}] Testing ARMAX({p},{q})...", end=" ")
+
+            # Initialize result row with default values
+            result_row = {
+                'p': p,
+                'q': q,
+                'aic': np.nan,
+                'passes_ljungbox': False,
+                'status': 'failed',
+                'error_message': '',
+                'timestamp': pd.Timestamp.now().isoformat()
+            }
+
+            # Initialize Ljung-Box columns with NaN
+            for lag in ljungbox_lags:
+                result_row[f'ljungbox_lag_{lag}_stat'] = np.nan
+                result_row[f'ljungbox_lag_{lag}_pval'] = np.nan
+
+            try:
+                # Fit ARMAX model
+                with warnings.catch_warnings():
+                    warnings.filterwarnings('ignore')
+                    model = sm.tsa.ARIMA(Y, exog=exog_vars, order=(p, 0, q))
+                    fitted = model.fit()
+                    result_row['aic'] = fitted.aic
+
+                    # Run Ljung-Box test
+                    lb_results = run_ljungbox_test(
+                        fitted.resid,
+                        lags=ljungbox_lags,
+                        return_results=True,
+                        print_output=False
+                    )
+
+                    # Store Ljung-Box results in flat structure
+                    for _, lb_row in lb_results.iterrows():
+                        lag = int(lb_row['lag'])
+                        result_row[f'ljungbox_lag_{lag}_stat'] = lb_row['test_stat']
+                        result_row[f'ljungbox_lag_{lag}_pval'] = lb_row['p_value']
+
+                    # Check if passes all Ljung-Box tests (all p-values > 0.05)
+                    result_row['passes_ljungbox'] = all(lb_results['p_value'] > 0.05)
+                    result_row['status'] = 'completed'
+
+                    # Print result
+                    lb_status = "✓ PASS" if result_row['passes_ljungbox'] else "✗ FAIL"
+                    print(f"AIC={result_row['aic']:.2f}, Ljung-Box: {lb_status}")
+
+            except Exception as e:
+                result_row['error_message'] = str(e)
+                result_row['status'] = 'failed'
+                print(f"FAILED - {str(e)[:50]}")
+
+            # Append to checkpoint DataFrame
+            new_row_df = pd.DataFrame([result_row])
+            if checkpoint_df.empty:
+                checkpoint_df = new_row_df
+            else:
+                checkpoint_df = pd.concat([checkpoint_df, new_row_df], ignore_index=True)
+
+            # Save checkpoint every N models
+            if len(checkpoint_df) % save_interval == 0:
+                checkpoint_df.to_csv(checkpoint_file, index=False)
+
+    # Final save
+    checkpoint_df.to_csv(checkpoint_file, index=False)
+    print(f"\nCheckpoint saved to: {checkpoint_file}")
+
+    # Selection logic with diagnostics
+    print("\n" + "="*80)
+    print("ARMAX LAG SELECTION RESULTS (with Ljung-Box diagnostics)")
+    print("="*80)
+
+    # Filter to models that passed Ljung-Box test
+    valid_models = checkpoint_df[
+        (checkpoint_df['status'] == 'completed') &
+        (checkpoint_df['passes_ljungbox'] == True)
+    ].copy()
+
+    # Handle case where no models pass Ljung-Box
+    if valid_models.empty:
+        print("\nWARNING: No specifications passed Ljung-Box test!")
+        print("This indicates persistent autocorrelation in residuals.")
+        print("Falling back to lowest AIC regardless of diagnostics...\n")
+        valid_models = checkpoint_df[checkpoint_df['status'] == 'completed'].copy()
+
+        if valid_models.empty:
+            print("ERROR: No specifications completed successfully!")
+            return None, checkpoint_df
+
+    # Select best by AIC
+    best_idx = valid_models['aic'].idxmin()
+    best_row = valid_models.loc[best_idx]
+    best_order = (int(best_row['p']), int(best_row['q']))
+
+    # Print summary table - Top 10 models that pass Ljung-Box
+    print("\nTop 10 models by AIC (that PASS Ljung-Box test):")
+    print(f"{'Rank':<6} {'Model':<15} {'AIC':<15} {'LB Pass':<10}")
+    print("-" * 50)
+
+    top_valid = valid_models.nsmallest(10, 'aic')
+    for idx, (_, row) in enumerate(top_valid.iterrows(), 1):
+        model_name = f"ARMAX({int(row['p'])},{int(row['q'])})"
+        lb_pass = "✓" if row['passes_ljungbox'] else "✗"
+        print(f"{idx:<6} {model_name:<15} {row['aic']:<15.2f} {lb_pass:<10}")
+
+    # Print best model details
+    print(f"\n{'='*80}")
+    print(f"BEST MODEL SELECTED: ARMAX{best_order}")
+    print(f"AIC: {best_row['aic']:.2f}")
+    print(f"Passes Ljung-Box: {'Yes' if best_row['passes_ljungbox'] else 'No'}")
+    print(f"{'='*80}")
+
+    # Print summary statistics
+    n_completed = len(checkpoint_df[checkpoint_df['status'] == 'completed'])
+    n_passed_lb = len(checkpoint_df[checkpoint_df['passes_ljungbox'] == True])
+    n_failed = len(checkpoint_df[checkpoint_df['status'] == 'failed'])
+
+    print(f"\nSummary Statistics:")
+    print(f"  Total specifications tested: {len(checkpoint_df)}")
+    print(f"  Successfully fitted: {n_completed}")
+    print(f"  Failed to fit: {n_failed}")
+    print(f"  Passed Ljung-Box test: {n_passed_lb} ({n_passed_lb/n_completed*100:.1f}%)")
+
+    return best_order, checkpoint_df
+
+
+def fit_garchx_model(armax_residuals, df, wind_var='Wind_Forecast_Log',
+                     p=1, q=1, show_diagnostics=True):
+    """
+    Fits GARCH(p,q)-X model on ARMAX residuals with Wind as exogenous variable.
+
+    Parameters:
+    - armax_residuals: Residuals from ARMAX mean equation (pd.Series)
+    - df: DataFrame with all variables (must include wind_var)
+    - wind_var: Name of wind variable for variance equation
+    - p: GARCH lag order (default 1)
+    - q: ARCH lag order (default 1)
+    - show_diagnostics: Run tests on standardized residuals
+
+    Returns:
+    - garch_res: Fitted ARCH model object (or None if fitting fails)
+    - diagnostics: Dict with test results (or None)
+    """
+    import time
+
+    print(f"\n--- Fitting GARCH({p},{q})-X model with {wind_var} in variance equation ---")
+    print("This may take 30-60 seconds...")
+
+    try:
+        # Align wind variable with residuals index
+        wind_series = df.loc[armax_residuals.index, wind_var]
+
+        # Check for NaNs
+        if wind_series.isna().any():
+            print(f"WARNING: {wind_var} contains NaN values. Dropping NaNs...")
+            valid_idx = ~(armax_residuals.isna() | wind_series.isna())
+            armax_residuals = armax_residuals[valid_idx]
+            wind_series = wind_series[valid_idx]
+
+        start_time = time.time()
+
+        # Specify GARCH(p,q)-X model
+        garch_spec = arch_model(
+            armax_residuals,
+            vol='GARCH',
+            p=p, q=q,
+            x=wind_series.values.reshape(-1, 1),  # Must be 2D array
+            rescale=False
+        )
+
+        # Fit with MLE
+        garch_res = garch_spec.fit(disp='off', show_warning=False)
+
+        elapsed_time = time.time() - start_time
+        print(f"GARCH fitting completed in {elapsed_time:.1f} seconds\n")
+
+        # Display results
+        print(f"\nVARIANCE EQUATION - GARCH({p},{q})-X:")
+        print(garch_res.summary())
+
+        # Extract standardized residuals
+        std_resid = garch_res.std_resid
+
+        # Run diagnostics if requested
+        diagnostics = None
+        if show_diagnostics:
+            print("\n" + "="*80)
+            print("DIAGNOSTIC TESTS ON GARCH STANDARDIZED RESIDUALS")
+            print("="*80)
+            print("(These should show NO autocorrelation and NO ARCH effects)")
+
+            # Ljung-Box test
+            run_ljungbox_test(std_resid, lags=[5, 10, 15, 20])
+
+            # Heteroskedasticity tests
+            run_heteroskedasticity_tests(std_resid, nlags=10)
+
+            diagnostics = {
+                'std_resid_mean': std_resid.mean(),
+                'std_resid_std': std_resid.std(),
+                'aic': garch_res.aic,
+                'bic': garch_res.bic
+            }
+
+        return garch_res, diagnostics
+
+    except Exception as e:
+        print(f"ERROR: GARCH fitting failed - {str(e)}")
+        print("Continuing with ARMAX-only results...")
+        return None, None
+
+
 def perform_multivariate_analysis(df, zone, target_region='SE1', use_log_transform=False, use_deseasonalized=False,
                                  run_ljungbox=False, run_hetero_tests=False, run_stationarity=False,
-                                 optimize_armax_lags=False, run_tvp_wind_kalman=False,
+                                 optimize_armax_lags=False, use_checkpointed_lag_selection=True,
+                                 run_tvp_wind_kalman=False,
                                  run_rolling_window=False, rolling_window_years=3,
                                  rolling_step_years=1, rolling_min_obs=24*180,
                                  run_quantile_regression=False, show_progress=True):
     """
-    Runs OLS and ARMAX-GARCHX with full control variables and optional diagnostic tests.
+    Runs OLS, ARMAX, and conditionally GARCH-X with full control variables.
+
+    GARCH-X is fitted only if ARCH effects detected in ARMAX residuals (p < 0.05).
 
     Parameters:
     - df: DataFrame with all variables
@@ -1816,6 +2140,11 @@ def perform_multivariate_analysis(df, zone, target_region='SE1', use_log_transfo
     - target_region: Target region for bottleneck dummies (default 'SE1')
     - use_log_transform: Use logged variables
     - use_deseasonalized: Use deseasonalized (logged) variables
+
+    Returns:
+    - ols_model: OLS regression results
+    - armax_res: ARMAX model results
+    - garch_res: GARCH-X results (None if not fitted)
     """
     print(f"\n--- RUNNING MULTIVARIATE ANALYSIS ({zone}) ---")
 
@@ -1896,7 +2225,7 @@ def perform_multivariate_analysis(df, zone, target_region='SE1', use_log_transfo
     # TVP Kalman Filter mode: run time-varying parameter analysis and return early
     if run_tvp_wind_kalman:
         run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, use_log_transform, plots_dir="plots")
-        return None, None  # Early return, skip OLS/ARMAX
+        return None, None, None  # Early return, skip OLS/ARMAX
 
     # Rolling-window mode: run rolling window analysis and return early
     if run_rolling_window:
@@ -1907,7 +2236,7 @@ def perform_multivariate_analysis(df, zone, target_region='SE1', use_log_transfo
                                     plots_dir="plots",
                                     results_dir="results",
                                     show_progress=show_progress)
-        return None, None  # Early return, skip OLS/ARMAX
+        return None, None, None  # Early return, skip OLS/ARMAX
 
     # Quantile regression mode: run quantile regression analysis and return early
     if run_quantile_regression:
@@ -1915,7 +2244,7 @@ def perform_multivariate_analysis(df, zone, target_region='SE1', use_log_transfo
                                          plots_dir="plots",
                                          results_dir="results",
                                          show_progress=show_progress)
-        return None, None  # Early return, skip OLS/ARMAX
+        return None, None, None  # Early return, skip OLS/ARMAX
 
     X = sm.add_constant(df[exog_vars])
 
@@ -1951,8 +2280,19 @@ def perform_multivariate_analysis(df, zone, target_region='SE1', use_log_transfo
 
     # Determine optimal lags if enabled, otherwise use default (3,3)
     if optimize_armax_lags:
-        optimal_order = select_armax_lags_aic(Y, df[exog_vars], max_p=10, max_q=10,
-                                               show_progress=show_progress)
+        if use_checkpointed_lag_selection:
+            # Use new checkpointed version with Ljung-Box diagnostics
+            optimal_order, checkpoint_df = select_armax_lags_aic_checkpointed(
+                Y, df[exog_vars],
+                zone=zone,
+                max_p=10, max_q=10,
+                checkpoint_file=None,  # Auto-generate based on zone
+                show_progress=show_progress
+            )
+        else:
+            # Use original version (no checkpointing)
+            optimal_order = select_armax_lags_aic(Y, df[exog_vars], max_p=10, max_q=10,
+                                                   show_progress=show_progress)
         armax_order = (optimal_order[0], 0, optimal_order[1])
     else:
         armax_order = (3, 0, 3)
@@ -1972,6 +2312,7 @@ def perform_multivariate_analysis(df, zone, target_region='SE1', use_log_transfo
     print(armax_res.summary())
 
     # Optional: Diagnostic tests on ARMAX residuals
+    arch_detected = False
     if run_ljungbox:
         print("\n" + "="*70)
         print("DIAGNOSTIC TESTS ON ARMAX RESIDUALS")
@@ -1979,10 +2320,53 @@ def perform_multivariate_analysis(df, zone, target_region='SE1', use_log_transfo
         run_ljungbox_test(armax_res.resid, lags=[5, 10, 15, 20])
 
     if run_hetero_tests:
+        # Run tests and check if ARCH effects detected
         run_heteroskedasticity_tests(armax_res.resid, nlags=10)
 
-    # GARCHX component can be added here if ARCH-effects are confirmed
-    return ols_model, armax_res
+        # Check ARCH test result
+        lm_stat, lm_pval, f_stat, f_pval = het_arch(armax_res.resid, nlags=10)
+        if lm_pval < 0.05:
+            arch_detected = True
+            print(f"\n{'='*70}")
+            print(f"ARCH EFFECTS DETECTED (p={lm_pval:.4f} < 0.05)")
+            print(f"Proceeding with GARCH-X modeling...")
+            print(f"{'='*70}")
+
+    # GARCH-X component: Fit if ARCH effects confirmed
+    garch_res = None
+    if arch_detected and FIT_GARCH_IF_ARCH:
+        # Determine wind variable based on transformation flags
+        if use_log_transform:
+            wind_var = 'Wind_Forecast_Log'
+        else:
+            wind_var = 'Wind_Forecast'
+
+        garch_res, garch_diagnostics = fit_garchx_model(
+            armax_res.resid,
+            df,
+            wind_var=wind_var,
+            p=GARCH_ORDER[0],
+            q=GARCH_ORDER[1],
+            show_diagnostics=True
+        )
+
+        # Compare AIC/BIC
+        if garch_res is not None:
+            print(f"\n{'='*70}")
+            print("MODEL COMPARISON")
+            print(f"{'='*70}")
+            print(f"ARMAX({armax_order[0]},{armax_order[2]}) AIC: {armax_res.aic:.2f}")
+            print(f"ARMAX-GARCH({GARCH_ORDER[0]},{GARCH_ORDER[1]})-X AIC: {garch_res.aic:.2f}")
+            improvement = armax_res.aic - garch_res.aic
+            print(f"AIC Improvement: {improvement:.2f} {'(better)' if improvement > 0 else '(worse)'}")
+            print(f"{'='*70}")
+    elif not arch_detected:
+        print(f"\n{'='*70}")
+        print("NO ARCH EFFECTS DETECTED - GARCH modeling not necessary")
+        print("ARMAX model is sufficient (constant variance assumption holds)")
+        print(f"{'='*70}")
+
+    return ols_model, armax_res, garch_res
 
 
 # --- 5. VISUALIZATION FUNCTIONS ---
@@ -2418,7 +2802,7 @@ def run_visualizations(data, zone, method='fredriksson', stage='raw', plots_dir=
 
 if __name__ == "__main__":
     # --- CONFIGURATION ---
-    ACTIVE_ZONE = 'SE3'
+    ACTIVE_ZONE = 'SE4'
 
     # --- VISUALIZATION TOGGLE ---
     # Toggle for data visualization and outlier detection
@@ -2448,7 +2832,7 @@ if __name__ == "__main__":
     # --- PROGRESS TRACKING TOGGLE ---
     # When True: displays progress bars for long-running operations (requires tqdm for best experience)
     # When False: minimal output (current behavior)
-    SHOW_PROGRESS_BARS = True
+    SHOW_PROGRESS_BARS = False
 
     # --- OUTLIER HANDLING TOGGLES ---
     # Toggle for outlier replacement
@@ -2494,16 +2878,16 @@ if __name__ == "__main__":
     # --- DIAGNOSTIC TEST TOGGLES (Fredriksson 2016 methodology) ---
     # Toggle for Ljung-Box test for autocorrelation
     # Tests whether residuals exhibit autocorrelation at various lag lengths
-    RUN_LJUNGBOX_TEST = False
+    RUN_LJUNGBOX_TEST = True
 
     # Toggle for heteroskedasticity and ARCH effects tests
     # Includes Engle's ARCH test and Ljung-Box Q test on squared residuals
     # If ARCH effects detected, consider implementing GARCHX model
-    RUN_HETEROSKEDASTICITY_TESTS = False
+    RUN_HETEROSKEDASTICITY_TESTS = True
 
     # Toggle for stationarity tests (ADF and DF-GLS)
     # Tests whether price series has a unit root (non-stationary)
-    RUN_STATIONARITY_TESTS = False
+    RUN_STATIONARITY_TESTS = True
 
     # --- MODEL SPECIFICATION TOGGLES ---
     # Toggle for automated ARMAX lag selection via AIC minimization
@@ -2511,6 +2895,19 @@ if __name__ == "__main__":
     # When False: Uses default ARMAX(3,3) specification
     # WARNING: This can take several minutes to run (tests 100 model combinations)
     OPTIMIZE_ARMAX_LAGS = False
+
+    # Toggle for checkpointed lag selection with Ljung-Box diagnostics
+    # When True: Uses checkpointed version that saves progress and includes diagnostics
+    # When False: Uses original version (no checkpointing)
+    # Only applies if OPTIMIZE_ARMAX_LAGS = True
+    USE_CHECKPOINTED_LAG_SELECTION = False
+
+    # --- GARCH CONFIGURATION ---
+    # Fit GARCH only if ARCH effects detected (p < 0.05)
+    FIT_GARCH_IF_ARCH = True
+    # GARCH order: (p, q) for GARCH(p,q)
+    GARCH_ORDER = (1, 1)
+    # Note: Variance equation uses Wind_Forecast_Log (hardcoded, following Fredriksson 2016)
 
     # --- TVP KALMAN FILTER TOGGLE ---
     # When True: estimates time-varying wind coefficient using state-space model
@@ -2520,12 +2917,12 @@ if __name__ == "__main__":
     # --- ROLLING-WINDOW ESTIMATION TOGGLE ---
     # When True: estimates wind coefficient using overlapping rolling windows (skips OLS/ARMAX)
     # When False: runs standard full-sample analysis
-    RUN_ROLLING_WINDOW = False
+    RUN_ROLLING_WINDOW = True
 
     # Rolling window configuration
-    ROLLING_WINDOW_YEARS = 1          # Window size in years
+    ROLLING_WINDOW_YEARS = 3          # Window size in years
     ROLLING_STEP_YEARS = 1            # Step size between windows in years
-    ROLLING_MIN_OBS = 24 * 180        # Minimum observations per window (6 months hourly data)
+    ROLLING_MIN_OBS = 24 * 365 * 3 - 24 * 30        # ~3 years minus 1 month tolerance
 
     # --- QUANTILE REGRESSION TOGGLE ---
     # When True: estimates wind coefficient across quantiles of price distribution (skips OLS/ARMAX)
@@ -2613,7 +3010,7 @@ if __name__ == "__main__":
         # --- STEP 6: REGRESSION ANALYSIS ---
         # Run regression models with optional diagnostic tests
         # Commodity prices used in regression are lagged by 24h (from load_data)
-        perform_multivariate_analysis(data, ACTIVE_ZONE,
+        ols_model, armax_res, garch_res = perform_multivariate_analysis(data, ACTIVE_ZONE,
                                       target_region=ACTIVE_ZONE,
                                       use_log_transform=USE_LOG_TRANSFORM,
                                       use_deseasonalized=USE_DESEASONALIZED,
@@ -2621,6 +3018,7 @@ if __name__ == "__main__":
                                       run_hetero_tests=RUN_HETEROSKEDASTICITY_TESTS,
                                       run_stationarity=RUN_STATIONARITY_TESTS,
                                       optimize_armax_lags=OPTIMIZE_ARMAX_LAGS,
+                                      use_checkpointed_lag_selection=USE_CHECKPOINTED_LAG_SELECTION,
                                       run_tvp_wind_kalman=RUN_TVP_WIND_KALMAN,
                                       run_rolling_window=RUN_ROLLING_WINDOW,
                                       rolling_window_years=ROLLING_WINDOW_YEARS,
