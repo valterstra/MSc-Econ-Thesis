@@ -12,14 +12,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.stats import gaussian_kde
 import holidays
+import ruptures as rpt
+from scipy import stats
 
-# Progress tracking
-try:
-    from tqdm import tqdm
-    TQDM_AVAILABLE = True
-except ImportError:
-    TQDM_AVAILABLE = False
-    print("Note: Install 'tqdm' for enhanced progress bars (pip install tqdm)")
 
 # Trading partners for congestion dummies (must match regional_data_combiner.py)
 TRADING_PARTNERS = {
@@ -43,11 +38,12 @@ def load_data(paths, target_region='SE1', zone_hydro='SE1', use_interpolation=Fa
 
     It then separately merges:
     - Hydro reserves from Master_Hydro_Reservoir.xlsx
-    - Commodity prices (Oil, Gas) from Master_Commodities.xlsx
+    - Light Crude Oil (hourly) from Light_Crude_Oil_2015_2025.xlsx
+    - TTF Gas prices (daily) from Master_Commodities.xlsx
     - Automatically lags commodity prices to align with day-ahead market timing
 
     Parameters:
-    - paths: dict with keys 'combined', 'hydro', 'commodities'
+    - paths: dict with keys 'combined', 'hydro', 'crude_oil', 'commodities'
     - target_region: Target region for analysis (default 'SE1')
     - zone_hydro: Zone for hydro reserves (default 'SE1')
     - use_interpolation: If True, interpolate missing values; if False, drop rows with NaN
@@ -59,7 +55,7 @@ def load_data(paths, target_region='SE1', zone_hydro='SE1', use_interpolation=Fa
     - DataFrame indexed by Datetime with columns:
       Price, Wind_Forecast, Hydro_Reserves, Net_Exchange, Consumption, Oil_Price, Gas_Price,
       plus bottleneck dummies (BNECK_{region}_{partner})
-      Note: Oil_Price and Gas_Price are automatically lagged by lag_commodity_hours
+      Note: Oil_Price (Light Crude Close) and Gas_Price (TTF) are automatically lagged by lag_commodity_hours
     """
     print("\n--- LOADING COMBINED REGIONAL DATA ---")
 
@@ -121,35 +117,52 @@ def load_data(paths, target_region='SE1', zone_hydro='SE1', use_interpolation=Fa
         print(f"  After hydro merge: {len(final_df)} observations")
 
     # Step 3: Load and merge commodity prices (always required)
-    print(f"\nLoading commodities from: {paths['commodities']}")
 
-    # Read commodity file with Bloomberg format (skip header rows)
+    # Step 3a: Load Light Crude Oil (hourly data)
+    print(f"\nLoading Light Crude Oil from: {paths['crude_oil']}")
+    df_crude = pd.read_excel(paths['crude_oil'])
+
+    # Process crude oil data
+    df_crude['Datetime'] = pd.to_datetime(df_crude['Timestamp'])
+    df_crude['Oil_Price'] = pd.to_numeric(df_crude['Close'], errors='coerce')  # Use Close price
+
+    df_crude_subset = df_crude[['Datetime', 'Oil_Price']].copy()
+
+    print(f"  Light Crude Oil data: {len(df_crude_subset)} hourly observations")
+    print(f"  Date range: {df_crude_subset['Datetime'].min()} to {df_crude_subset['Datetime'].max()}")
+    print(f"  Using Close price (USD/barrel)")
+
+    # Merge on Datetime (hourly to hourly)
+    final_df = pd.merge(final_df, df_crude_subset, on='Datetime', how='left')
+    print(f"  After crude oil merge: {len(final_df)} observations")
+
+    # Step 3b: Load TTF Gas (daily data from Bloomberg)
+    print(f"\nLoading TTF Gas from: {paths['commodities']}")
     df_comm = pd.read_excel(paths['commodities'], header=None, skiprows=5)
     df_comm.columns = ['Date', 'TTF_Gas', 'WTI_Oil', 'Brent_Oil', 'MT1', 'LUA1', 'CP1']
 
-    # Process commodity data
+    # Process gas data only
     df_comm['Date'] = pd.to_datetime(df_comm['Date'], errors='coerce')
     df_comm = df_comm.dropna(subset=['Date'])
-    df_comm['Brent_Oil'] = pd.to_numeric(df_comm['Brent_Oil'], errors='coerce')
     df_comm['TTF_Gas'] = pd.to_numeric(df_comm['TTF_Gas'], errors='coerce')
 
-    df_commodities = df_comm[['Date', 'Brent_Oil', 'TTF_Gas']].copy()
-    df_commodities.columns = ['Date', 'Oil_Price', 'Gas_Price']
+    df_gas = df_comm[['Date', 'TTF_Gas']].copy()
+    df_gas.columns = ['Date', 'Gas_Price']
 
-    print(f"  Commodity data: {len(df_commodities)} daily observations")
-    print(f"  Date range: {df_commodities['Date'].min().date()} to {df_commodities['Date'].max().date()}")
+    print(f"  TTF Gas data: {len(df_gas)} daily observations")
+    print(f"  Date range: {df_gas['Date'].min().date()} to {df_gas['Date'].max().date()}")
 
     # Create date column for merging (extract date from hourly Datetime)
     final_df['Date'] = final_df['Datetime'].dt.date
-    df_commodities['Date'] = df_commodities['Date'].dt.date
+    df_gas['Date'] = df_gas['Date'].dt.date
 
-    # Merge commodities on date (each hour gets the daily commodity price)
-    final_df = pd.merge(final_df, df_commodities, on='Date', how='left')
+    # Merge gas on date (each hour gets the daily gas price)
+    final_df = pd.merge(final_df, df_gas, on='Date', how='left')
     final_df = final_df.drop(columns=['Date'])
 
-    print(f"  Merged commodity prices: Oil (USD/barrel), Gas (EUR/MWh)")
+    print(f"  Merged commodity prices: Oil_Price (Light Crude hourly, USD/barrel), Gas_Price (TTF daily, EUR/MWh)")
 
-    # Step 3b: Lag commodity prices for day-ahead market alignment
+    # Step 3c: Lag commodity prices for day-ahead market alignment
     print(f"\n--- LAGGING COMMODITY PRICES BY {lag_commodity_hours} HOURS ---")
     print("Rationale: Day-ahead market pricing uses commodity prices from bidding time (D-1)")
 
@@ -241,50 +254,6 @@ def load_data(paths, target_region='SE1', zone_hydro='SE1', use_interpolation=Fa
     return final_df
 
 
-def create_progress_bar(total, desc, disable=False):
-    """Create progress bar with fallback to print statements."""
-    if disable or not TQDM_AVAILABLE:
-        class SimpleFallback:
-            def __init__(self, total, desc):
-                self.total = total
-                self.desc = desc
-                self.n = 0
-                self.start_time = __import__('time').time()
-                print(f"\n{desc} (0/{total})")
-
-            def update(self, n=1):
-                self.n += n
-                if self.total > 0:
-                    pct = (self.n / self.total) * 100
-                    # Print at 10% intervals and completion
-                    if self.n == self.total or pct % 10 < (100/self.total):
-                        elapsed = __import__('time').time() - self.start_time
-                        rate = self.n / elapsed if elapsed > 0 else 0
-                        eta = (self.total - self.n) / rate if rate > 0 and self.n < self.total else 0
-                        print(f"  Progress: {self.n}/{self.total} ({pct:.0f}%) | "
-                              f"Elapsed: {elapsed:.0f}s | ETA: {eta:.0f}s")
-
-            def set_description(self, desc):
-                pass
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                elapsed = __import__('time').time() - self.start_time
-                print(f"  Completed: {self.n}/{self.total} in {elapsed:.0f}s\n")
-
-        return SimpleFallback(total, desc)
-
-    return tqdm(
-        total=total,
-        desc=desc,
-        unit='it',
-        bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
-        ncols=100
-    )
-
-
 # --- 2. DATA PREPROCESSING FUNCTIONS ---
 
 def handle_negative_prices(df, method='clip'):
@@ -342,7 +311,7 @@ def handle_negative_prices(df, method='clip'):
             print(f"  {var}: NOT FOUND in dataframe")
 
     if not found_negatives:
-        print("  ✓ No negative values found in any variable")
+        print("  [OK] No negative values found in any variable")
 
     print("\n  Net_Exchange: NOT CHECKED (expected to have negative values)")
 
@@ -398,7 +367,7 @@ def handle_negative_prices(df, method='clip'):
     return df_clean
 
 
-def handle_outliers_fredriksson(df, use_log_transform=False, use_deseasonalized=False):
+def handle_outliers_fredriksson(df, apply_to_raw=False):
     """
     Replace outliers using Fredriksson (2016) methodology.
 
@@ -411,8 +380,8 @@ def handle_outliers_fredriksson(df, use_log_transform=False, use_deseasonalized=
     - Only applied to PRICE series, not explanatory variables
 
     Parameters:
-    - use_log_transform: If True, works on logged price
-    - use_deseasonalized: If True, works on deseasonalized logged price
+    - apply_to_raw: If True, applies to raw 'Price' column (early handling before log transform)
+                    If False, applies to 'Price_Log_Deseasonalized' column (late handling)
 
     Returns:
     - DataFrame with outliers replaced in Price
@@ -423,24 +392,16 @@ def handle_outliers_fredriksson(df, use_log_transform=False, use_deseasonalized=
     print("OUTLIER HANDLING - FREDRIKSSON (2016) METHODOLOGY")
     print("="*80)
 
-    # Determine which Price column to use based on flags
-    if use_log_transform and use_deseasonalized:
-        if 'Price_Log_Deseasonalized' in df.columns:
-            price_col = 'Price_Log_Deseasonalized'
-            print("Applying to: Logged and Deseasonalized Price")
-        else:
+    # Determine which Price column to use
+    if apply_to_raw:
+        price_col = 'Price'
+        print("Applying to: Raw Price (before log transformation)")
+    else:
+        if 'Price_Log_Deseasonalized' not in df.columns:
             print("Warning: Price_Log_Deseasonalized not found. Cannot apply outlier handling.")
             return df, {}
-    elif use_log_transform:
-        if 'Price_Log' in df.columns:
-            price_col = 'Price_Log'
-            print("Applying to: Logged Price")
-        else:
-            print("Warning: Price_Log not found. Cannot apply outlier handling.")
-            return df, {}
-    else:
-        price_col = 'Price'
-        print("Applying to: Raw Price")
+        price_col = 'Price_Log_Deseasonalized'
+        print("Applying to: Logged and Deseasonalized Price")
 
     print("Replacing outliers with mean of 24 and 48 hours before/after")
     print("Note: Outlier handling only applied to Price, not explanatory variables\n")
@@ -545,7 +506,7 @@ def handle_outliers_fredriksson(df, use_log_transform=False, use_deseasonalized=
     return df_clean, outlier_stats
 
 
-def handle_outliers_gianfreda(df, use_log_transform=False, use_deseasonalized=False):
+def handle_outliers_gianfreda(df, apply_to_raw=False):
     """
     Replace outliers using Gianfreda (2010) / Mugele et al. (2005) methodology.
 
@@ -557,8 +518,8 @@ def handle_outliers_gianfreda(df, use_log_transform=False, use_deseasonalized=Fa
     - Each weekday has its own 3σ threshold (Monday outliers capped at Monday's 3σ, etc.)
 
     Parameters:
-    - use_log_transform: If True, works on logged price
-    - use_deseasonalized: If True, works on deseasonalized logged price
+    - apply_to_raw: If True, applies to raw 'Price' column (early handling before log transform)
+                    If False, applies to 'Price_Log_Deseasonalized' column (late handling)
 
     Returns:
     - DataFrame with outliers replaced in Price
@@ -569,24 +530,16 @@ def handle_outliers_gianfreda(df, use_log_transform=False, use_deseasonalized=Fa
     print("OUTLIER HANDLING - GIANFREDA (2010) / MUGELE ET AL. (2005) METHODOLOGY")
     print("="*80)
 
-    # Determine which Price column to use based on flags
-    if use_log_transform and use_deseasonalized:
-        if 'Price_Log_Deseasonalized' in df.columns:
-            price_col = 'Price_Log_Deseasonalized'
-            print("Applying to: Logged and Deseasonalized Price")
-        else:
+    # Determine which Price column to use
+    if apply_to_raw:
+        price_col = 'Price'
+        print("Applying to: Raw Price (before log transformation)")
+    else:
+        if 'Price_Log_Deseasonalized' not in df.columns:
             print("Warning: Price_Log_Deseasonalized not found. Cannot apply outlier handling.")
             return df, {}
-    elif use_log_transform:
-        if 'Price_Log' in df.columns:
-            price_col = 'Price_Log'
-            print("Applying to: Logged Price")
-        else:
-            print("Warning: Price_Log not found. Cannot apply outlier handling.")
-            return df, {}
-    else:
-        price_col = 'Price'
-        print("Applying to: Raw Price")
+        price_col = 'Price_Log_Deseasonalized'
+        print("Applying to: Logged and Deseasonalized Price")
 
     print("Replacing outliers with ±3*std threshold for respective weekday")
     print("Note: Outlier handling only applied to Price, not explanatory variables\n")
@@ -1066,7 +1019,7 @@ def run_stationarity_tests(series, series_name="Series"):
 
 # --- 4. MODELING FUNCTIONS ---
 
-def run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, use_log_transform=True, plots_dir="plots"):
+def run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, plots_dir="plots"):
     """
     Estimate time-varying parameter (TVP) model for the wind coefficient using state-space Kalman filter.
 
@@ -1076,6 +1029,8 @@ def run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, use_log_transform=True,
 
     Uses Frisch-Waugh-Lovell partialling out to control for other regressors,
     then estimates a random-walk state-space model for the wind coefficient.
+
+    Note: Always uses Wind_Forecast_Log (logged wind variable).
 
     **IMPORTANT - NEEDS FURTHER INVESTIGATION:**
     Current implementation on hourly data shows excessive high-frequency volatility,
@@ -1100,7 +1055,6 @@ def run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, use_log_transform=True,
     - zone: Price zone identifier (e.g., 'SE1')
     - Y: Dependent variable (price series)
     - exog_vars: List of exogenous variable names
-    - use_log_transform: If True, uses Wind_Forecast_Log; otherwise Wind_Forecast
     - plots_dir: Directory to save output plots
     """
     print("\n" + "="*80)
@@ -1113,11 +1067,8 @@ def run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, use_log_transform=True,
     if not os.path.exists(plots_dir):
         os.makedirs(plots_dir)
 
-    # Step 1: Identify wind column based on mode
-    if use_log_transform:
-        wind_col = 'Wind_Forecast_Log'
-    else:
-        wind_col = 'Wind_Forecast'
+    # Always use logged wind variable
+    wind_col = 'Wind_Forecast_Log'
 
     print(f"\nWind variable: {wind_col}")
 
@@ -1198,17 +1149,10 @@ def run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, use_log_transform=True,
     # Fit the model
     tvp_model = TVPWind(y_star, w_star)
 
-    print("\n--- Fitting TVP Model (this may take 1-5 minutes) ---")
-    import time
-    start_time = time.time()
-
     import warnings
     with warnings.catch_warnings():
         warnings.filterwarnings('ignore')
         tvp_results = tvp_model.fit(disp=False)
-
-    elapsed_time = time.time() - start_time
-    print(f"Model fitting completed in {elapsed_time:.1f} seconds ({elapsed_time/60:.1f} minutes)")
 
     # Step 5: Extract results
     beta_t = tvp_results.smoothed_state[0]
@@ -1293,18 +1237,19 @@ def run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, use_log_transform=True,
     return beta_t, se_t, tvp_results
 
 
-def run_rolling_window_analysis(df, zone, Y, exog_vars, use_log_transform,
+def run_rolling_window_analysis(df, zone, Y, exog_vars,
                                 window_years=3, step_years=1, min_obs=24*180,
-                                plots_dir="plots", results_dir="results", show_progress=True):
+                                plots_dir="plots", results_dir="results"):
     """
     Estimate wind coefficient using overlapping rolling windows with OLS.
+
+    Note: Always uses logged variables (Wind_Forecast_Log).
 
     Parameters:
     - df: DataFrame with all variables
     - zone: Price zone identifier
     - Y: Dependent variable (Series)
     - exog_vars: List of exogenous variable column names
-    - use_log_transform: Whether log transformation was applied
     - window_years: Size of each rolling window in years
     - step_years: Step size between windows in years
     - min_obs: Minimum observations required per window
@@ -1320,7 +1265,11 @@ def run_rolling_window_analysis(df, zone, Y, exog_vars, use_log_transform,
     print("="*80)
     print(f"\nConfiguration:")
     print(f"  Window size: {window_years} years")
-    print(f"  Step size: {step_years} year(s)")
+    step_months = int(round(step_years * 12)) if step_years < 1 else None
+    if step_months:
+        print(f"  Step size: {step_months} month(s)")
+    else:
+        print(f"  Step size: {step_years} year(s)")
     print(f"  Minimum observations per window: {min_obs:,}")
 
     # Identify wind column from exog_vars
@@ -1353,7 +1302,10 @@ def run_rolling_window_analysis(df, zone, Y, exog_vars, use_log_transform,
         temp_window = tmp[(tmp.index >= temp_start) & (tmp.index < temp_end)]
         if len(temp_window) >= min_obs:
             total_windows += 1
-        temp_start = temp_start + relativedelta(years=step_years)
+        if step_months:
+            temp_start = temp_start + relativedelta(months=step_months)
+        else:
+            temp_start = temp_start + relativedelta(years=int(step_years))
 
     print(f"\n--- Estimating Rolling Windows ---")
     print(f"Total windows to estimate: {total_windows}\n")
@@ -1396,7 +1348,10 @@ def run_rolling_window_analysis(df, zone, Y, exog_vars, use_log_transform,
 
             print(f"β_wind={model.params[wind_col]:.4f}, p={model.pvalues[wind_col]:.4f}")
 
-        current_start = current_start + relativedelta(years=step_years)
+        if step_months:
+            current_start = current_start + relativedelta(months=step_months)
+        else:
+            current_start = current_start + relativedelta(years=int(step_years))
 
     if not results:
         print("\nWARNING: No valid windows found. Check data range and window parameters.")
@@ -1489,18 +1444,1135 @@ def run_rolling_window_analysis(df, zone, Y, exog_vars, use_log_transform,
     print("="*80)
 
 
-def run_quantile_regression_analysis(df, zone, use_log_transform,
-                                     plots_dir="plots", results_dir="results", show_progress=True):
+def run_structural_break_analysis(df, zone, Y, exog_vars,
+                                  max_breaks=5, min_segment_length=None,
+                                  known_break_dates=None, trimming=0.15,
+                                  window_years=1, step_years=1/12,
+                                  min_obs=24*365 - 24*30,
+                                  config_label=None,
+                                  plots_dir="plots", results_dir="results"):
     """
-    Estimate wind coefficient across quantiles of the price distribution.
+    Detect structural breaks in the wind coefficient using Bai-Perron methodology.
 
-    Uses raw/log variables (NOT deseasonalized) with calendar dummies included directly
-    in the regression to control for seasonality (FULL basis: Year+Month+DOW+Hour+Holiday).
+    This function:
+    1. Estimates rolling window coefficients to visualize coefficient evolution
+    2. Applies Bai-Perron change point detection to identify structural breaks
+    3. Runs Chow tests at detected break points and known event dates
+    4. Generates CUSUM plots for parameter stability diagnostics
+    5. Outputs comprehensive results and visualizations
+
+    Note: Always uses logged variables (Wind_Forecast_Log).
 
     Parameters:
     - df: DataFrame with all variables
     - zone: Price zone identifier
-    - use_log_transform: Whether log transformation was applied
+    - Y: Dependent variable (Series)
+    - exog_vars: List of exogenous variable column names
+    - max_breaks: Maximum number of breaks to detect (default 5)
+    - min_segment_length: Minimum observations between breaks (default: 10% of data)
+    - known_break_dates: List of dates to test with Chow test (e.g., ['2022-02-24'] for Ukraine invasion).
+                          Set to None or [] to only use Bai-Perron detected breaks.
+    - trimming: Fraction of data to trim from endpoints for break detection (default 0.15)
+    - window_years: Rolling window size in years (default 1)
+    - step_years: Step size between windows in years (default 1/12 = 1 month)
+    - min_obs: Minimum observations required per window (default 24*365 - 24*30)
+    - config_label: Custom label for this configuration (e.g., '1y_window_1m_step').
+                    If None, auto-generated from window_years and step_years.
+    - plots_dir: Directory for saving plots
+    - results_dir: Directory for saving CSV results
+
+    Returns:
+    - Dictionary with break detection results
+    """
+    from dateutil.relativedelta import relativedelta
+
+    # Generate config label for file naming if not provided
+    if config_label is None:
+        step_months = int(round(step_years * 12)) if step_years < 1 else None
+        if window_years == int(window_years):
+            window_label = f"{int(window_years)}y"
+        else:
+            window_label = f"{window_years:.1f}y"
+        if step_months:
+            step_label = f"{step_months}m"
+        else:
+            step_label = f"{int(step_years)}y" if step_years == int(step_years) else f"{step_years:.1f}y"
+
+        config_label = f"{window_label}_window_{step_label}_step"
+
+    print("\n" + "="*80)
+    print("STRUCTURAL BREAK ANALYSIS - BAI-PERRON METHODOLOGY")
+    print("="*80)
+
+    # Identify wind column from exog_vars
+    wind_col = [col for col in exog_vars if 'Wind' in col and 'Forecast' in col][0]
+    control_cols = [col for col in exog_vars if col != wind_col]
+
+    step_months = int(round(step_years * 12)) if step_years < 1 else None
+
+    print(f"\nConfiguration:")
+    print(f"  Zone: {zone}")
+    print(f"  Config label: {config_label}")
+    print(f"  Target coefficient: {wind_col}")
+    print(f"  Rolling window: {window_years} year(s)")
+    if step_months:
+        print(f"  Step size: {step_months} month(s)")
+    else:
+        print(f"  Step size: {step_years} year(s)")
+    print(f"  Minimum observations per window: {min_obs:,}")
+    print(f"  Maximum breaks to detect: {max_breaks}")
+    print(f"  Trimming (endpoints): {trimming*100:.0f}%")
+    if known_break_dates:
+        print(f"  Known event dates to test: {known_break_dates}")
+    else:
+        print(f"  Known event dates: None (using only Bai-Perron detection)")
+
+    # Prepare clean data
+    cols_needed = [Y.name] + exog_vars
+    tmp = df[cols_needed].dropna().copy()
+    tmp = tmp.sort_index()
+
+    n_obs = len(tmp)
+    print(f"\nData range: {tmp.index.min()} to {tmp.index.max()}")
+    print(f"Total observations: {n_obs:,}")
+
+    # Set minimum segment length (default: 10% of data or ~1 year of hourly data)
+    if min_segment_length is None:
+        min_segment_length = max(int(n_obs * 0.10), 24 * 365)  # At least 1 year
+    print(f"Minimum segment length: {min_segment_length:,} observations (~{min_segment_length/(24*365):.1f} years)")
+
+    # Create output directories with structural break subdirectories
+    zone_plots_dir = os.path.join(plots_dir, zone, "structural_break_analysis")
+    os.makedirs(zone_plots_dir, exist_ok=True)
+
+    zone_results_dir = os.path.join(results_dir, "structural_break_analysis")
+    os.makedirs(zone_results_dir, exist_ok=True)
+
+    results = {
+        'zone': zone,
+        'config_label': config_label,
+        'window_years': window_years,
+        'step_years': step_years,
+        'min_obs': min_obs,
+        'n_obs': n_obs,
+        'detected_breaks': [],
+        'chow_tests': [],
+        'bic_scores': {}
+    }
+
+    # =========================================================================
+    # STEP 1: ROLLING WINDOW ESTIMATION (for coefficient time series)
+    # =========================================================================
+    print("\n" + "-"*80)
+    print("STEP 1: ESTIMATING ROLLING WINDOW COEFFICIENTS")
+    print("-"*80)
+    print(f"Window settings: {window_years} year(s) window, "
+          f"{f'{step_months} month(s)' if step_months else f'{step_years} year(s)'} step")
+
+    rolling_results = []
+    start_date = tmp.index.min()
+    end_of_data = tmp.index.max()
+    current_start = start_date
+
+    while current_start <= end_of_data:
+        window_end = current_start + relativedelta(years=window_years)
+        window_data = tmp[(tmp.index >= current_start) & (tmp.index < window_end)]
+
+        if len(window_data) >= min_obs:
+            # Run OLS regression
+            X = sm.add_constant(window_data[exog_vars])
+            y = window_data[Y.name]
+            model = sm.OLS(y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 24})
+
+            # Calculate window midpoint
+            midpoint = current_start + relativedelta(months=window_years * 6)
+
+            rolling_results.append({
+                'midpoint': midpoint,
+                'beta_wind': model.params[wind_col],
+                'se_wind': model.bse[wind_col],
+                'pvalue': model.pvalues[wind_col],
+                'r_squared': model.rsquared
+            })
+
+        if step_months:
+            current_start = current_start + relativedelta(months=step_months)
+        else:
+            current_start = current_start + relativedelta(years=int(step_years))
+
+    rolling_df = pd.DataFrame(rolling_results)
+    print(f"Estimated {len(rolling_df)} rolling window coefficients")
+    print(f"Coefficient range: [{rolling_df['beta_wind'].min():.4f}, {rolling_df['beta_wind'].max():.4f}]")
+
+    # =========================================================================
+    # STEP 2: BAI-PERRON CHANGE POINT DETECTION
+    # =========================================================================
+    print("\n" + "-"*80)
+    print("STEP 2: BAI-PERRON CHANGE POINT DETECTION")
+    print("-"*80)
+
+    # Prepare signal for change point detection
+    beta_signal = rolling_df['beta_wind'].values.reshape(-1, 1)
+
+    # Method 1: PELT (Pruned Exact Linear Time) - optimal for multiple breaks
+    print("\nMethod 1: PELT algorithm (optimal partitioning)")
+    algo_pelt = rpt.Pelt(model="rbf", min_size=max(3, len(beta_signal)//20)).fit(beta_signal)
+
+    # Use BIC-like penalty: pen = log(n) * dim * sigma^2
+    # Adjust penalty to control number of breaks
+    sigma = np.std(beta_signal)
+    pen = np.log(len(beta_signal)) * sigma**2 * 2  # Moderate penalty
+
+    try:
+        breaks_pelt = algo_pelt.predict(pen=pen)
+        # Remove the last element (which is always n)
+        breaks_pelt = [b for b in breaks_pelt if b < len(beta_signal)]
+        print(f"  PELT detected {len(breaks_pelt)} break(s) at indices: {breaks_pelt}")
+    except Exception as e:
+        print(f"  PELT failed: {e}")
+        breaks_pelt = []
+
+    # Method 2: Binary Segmentation (faster, good approximation)
+    print("\nMethod 2: Binary Segmentation algorithm")
+    algo_binseg = rpt.Binseg(model="l2", min_size=max(3, len(beta_signal)//20)).fit(beta_signal)
+
+    try:
+        breaks_binseg = algo_binseg.predict(n_bkps=max_breaks)
+        breaks_binseg = [b for b in breaks_binseg if b < len(beta_signal)]
+        print(f"  BinSeg detected {len(breaks_binseg)} break(s) at indices: {breaks_binseg}")
+    except Exception as e:
+        print(f"  BinSeg failed: {e}")
+        breaks_binseg = []
+
+    # Method 3: Dynamic Programming (exact solution)
+    print("\nMethod 3: Dynamic Programming (exact, slower)")
+    algo_dynp = rpt.Dynp(model="l2", min_size=max(3, len(beta_signal)//20)).fit(beta_signal)
+
+    # Test different numbers of breaks and compute BIC
+    print("\n  Testing different numbers of breaks (BIC selection):")
+    bic_results = []
+
+    for n_breaks in range(0, max_breaks + 1):
+        try:
+            if n_breaks == 0:
+                # No breaks: cost is total variance
+                cost = np.sum((beta_signal - np.mean(beta_signal))**2)
+                n_params = 1
+            else:
+                breaks = algo_dynp.predict(n_bkps=n_breaks)
+                breaks = [0] + [b for b in breaks if b < len(beta_signal)] + [len(beta_signal)]
+
+                # Calculate cost (sum of squared residuals within segments)
+                cost = 0
+                for i in range(len(breaks) - 1):
+                    segment = beta_signal[breaks[i]:breaks[i+1]]
+                    if len(segment) > 0:
+                        cost += np.sum((segment - np.mean(segment))**2)
+                n_params = n_breaks + 1  # n_breaks + 1 segment means
+
+            # BIC = n*log(RSS/n) + k*log(n)
+            n = len(beta_signal)
+            bic = n * np.log(cost / n + 1e-10) + n_params * np.log(n)
+            bic_results.append({'n_breaks': n_breaks, 'bic': bic, 'cost': cost})
+            print(f"    {n_breaks} breaks: BIC = {bic:.2f}")
+
+        except Exception as e:
+            print(f"    {n_breaks} breaks: Failed ({e})")
+
+    # Select optimal number of breaks by BIC
+    if bic_results:
+        bic_df = pd.DataFrame(bic_results)
+        optimal_n_breaks = bic_df.loc[bic_df['bic'].idxmin(), 'n_breaks']
+        print(f"\n  Optimal number of breaks (BIC): {int(optimal_n_breaks)}")
+        results['bic_scores'] = bic_results
+
+        # Get break points for optimal model
+        if optimal_n_breaks > 0:
+            optimal_breaks = algo_dynp.predict(n_bkps=int(optimal_n_breaks))
+            optimal_breaks = [b for b in optimal_breaks if b < len(beta_signal)]
+        else:
+            optimal_breaks = []
+    else:
+        optimal_n_breaks = 0
+        optimal_breaks = []
+
+    # Convert break indices to dates
+    detected_break_dates = []
+    for brk_idx in optimal_breaks:
+        if brk_idx < len(rolling_df):
+            break_date = rolling_df.iloc[brk_idx]['midpoint']
+            detected_break_dates.append(break_date)
+            print(f"\n  Break detected at: {break_date.strftime('%Y-%m-%d')}")
+
+    results['detected_breaks'] = detected_break_dates
+    results['optimal_n_breaks'] = int(optimal_n_breaks)
+
+    # =========================================================================
+    # STEP 3: CHOW TESTS AT DETECTED AND KNOWN BREAK DATES
+    # =========================================================================
+    print("\n" + "-"*80)
+    print("STEP 3: CHOW TESTS FOR STRUCTURAL BREAKS")
+    print("-"*80)
+
+    # Combine detected breaks with known event dates
+    test_dates = []
+
+    # Add detected break dates
+    for bd in detected_break_dates:
+        test_dates.append({'date': bd, 'source': 'Bai-Perron detected'})
+
+    # Add known event dates
+    if known_break_dates:
+        for date_str in known_break_dates:
+            test_dates.append({'date': pd.to_datetime(date_str), 'source': 'Known event'})
+
+    # Run Chow tests
+    chow_results = []
+
+    for test_info in test_dates:
+        break_date = test_info['date']
+        source = test_info['source']
+
+        print(f"\nTesting break at {break_date.strftime('%Y-%m-%d')} ({source}):")
+
+        # Split data
+        pre_break = tmp[tmp.index < break_date]
+        post_break = tmp[tmp.index >= break_date]
+
+        if len(pre_break) < 100 or len(post_break) < 100:
+            print(f"  Skipped: Insufficient observations (pre={len(pre_break)}, post={len(post_break)})")
+            continue
+
+        # Full sample regression
+        X_full = sm.add_constant(tmp[exog_vars])
+        y_full = tmp[Y.name]
+        model_full = sm.OLS(y_full, X_full).fit()
+        rss_full = model_full.ssr
+        k = len(model_full.params)
+
+        # Pre-break regression
+        X_pre = sm.add_constant(pre_break[exog_vars])
+        y_pre = pre_break[Y.name]
+        model_pre = sm.OLS(y_pre, X_pre).fit()
+        rss_pre = model_pre.ssr
+
+        # Post-break regression
+        X_post = sm.add_constant(post_break[exog_vars])
+        y_post = post_break[Y.name]
+        model_post = sm.OLS(y_post, X_post).fit()
+        rss_post = model_post.ssr
+
+        # Chow F-statistic
+        rss_unrestricted = rss_pre + rss_post
+        n = len(tmp)
+        f_stat = ((rss_full - rss_unrestricted) / k) / (rss_unrestricted / (n - 2*k))
+        p_value = 1 - stats.f.cdf(f_stat, k, n - 2*k)
+
+        # Wind coefficient comparison
+        beta_pre = model_pre.params[wind_col]
+        beta_post = model_post.params[wind_col]
+        se_pre = model_pre.bse[wind_col]
+        se_post = model_post.bse[wind_col]
+
+        print(f"  Pre-break:  n={len(pre_break):,}, beta_wind={beta_pre:.4f} (SE={se_pre:.4f})")
+        print(f"  Post-break: n={len(post_break):,}, beta_wind={beta_post:.4f} (SE={se_post:.4f})")
+        print(f"  Change in beta_wind: {beta_post - beta_pre:.4f} ({((beta_post - beta_pre)/abs(beta_pre))*100:.1f}%)")
+        print(f"  Chow F-statistic: {f_stat:.2f}")
+        print(f"  p-value: {p_value:.4e}")
+        print(f"  Significant at 5%: {'YES' if p_value < 0.05 else 'NO'}")
+        print(f"  Significant at 1%: {'YES' if p_value < 0.01 else 'NO'}")
+
+        chow_results.append({
+            'break_date': break_date,
+            'source': source,
+            'n_pre': len(pre_break),
+            'n_post': len(post_break),
+            'beta_wind_pre': beta_pre,
+            'beta_wind_post': beta_post,
+            'se_pre': se_pre,
+            'se_post': se_post,
+            'beta_change': beta_post - beta_pre,
+            'beta_change_pct': ((beta_post - beta_pre)/abs(beta_pre))*100,
+            'f_statistic': f_stat,
+            'p_value': p_value,
+            'significant_5pct': p_value < 0.05,
+            'significant_1pct': p_value < 0.01
+        })
+
+    results['chow_tests'] = chow_results
+
+    # =========================================================================
+    # STEP 4: CUSUM TEST FOR PARAMETER STABILITY
+    # =========================================================================
+    print("\n" + "-"*80)
+    print("STEP 4: CUSUM TEST FOR PARAMETER STABILITY")
+    print("-"*80)
+
+    # Run recursive OLS and compute CUSUM
+    X_full = sm.add_constant(tmp[exog_vars])
+    y_full = tmp[Y.name].values
+
+    # For CUSUM, we need recursive residuals
+    # Simplified approach: compute rolling prediction errors
+    print("\nComputing CUSUM statistics...")
+
+    # Start recursive estimation after initial window
+    init_window = max(len(exog_vars) * 10, 24 * 30)  # At least 1 month
+    recursive_residuals = []
+    recursive_dates = []
+
+    for t in range(init_window, n_obs, 24 * 7):  # Weekly steps for speed
+        # Estimate on data up to t
+        X_t = sm.add_constant(tmp[exog_vars].iloc[:t])
+        y_t = tmp[Y.name].iloc[:t]
+        model_t = sm.OLS(y_t, X_t).fit()
+
+        # One-step-ahead prediction error
+        if t < n_obs:
+            # Get the next observation's exog values and manually add constant
+            # (sm.add_constant behaves inconsistently with single-row DataFrames)
+            X_next_raw = tmp[exog_vars].iloc[t].values
+            X_next = np.concatenate([[1.0], X_next_raw])  # Prepend constant
+            y_next = tmp[Y.name].iloc[t]
+            pred = model_t.predict(X_next.reshape(1, -1))[0]
+            resid = y_next - pred
+            recursive_residuals.append(resid)
+            recursive_dates.append(tmp.index[t])
+
+    recursive_residuals = np.array(recursive_residuals)
+    sigma_resid = np.std(recursive_residuals)
+
+    # Standardized cumulative sum
+    cusum = np.cumsum(recursive_residuals) / (sigma_resid * np.sqrt(len(recursive_residuals)))
+
+    # Critical values (5% significance): ±0.948 * sqrt(n) at endpoints
+    # Linear boundaries that start at 0 and reach ±0.948*sqrt(n)
+    n_cusum = len(cusum)
+    t_values = np.arange(1, n_cusum + 1)
+    upper_bound = 0.948 * np.sqrt(n_cusum) * (t_values / n_cusum)
+    lower_bound = -upper_bound
+
+    # Check for boundary violations
+    violations = (cusum > upper_bound) | (cusum < lower_bound)
+    n_violations = np.sum(violations)
+
+    print(f"CUSUM observations: {n_cusum}")
+    print(f"Boundary violations: {n_violations} ({100*n_violations/n_cusum:.1f}%)")
+    if n_violations > 0:
+        first_violation_idx = np.where(violations)[0][0]
+        first_violation_date = recursive_dates[first_violation_idx]
+        print(f"First violation at: {first_violation_date}")
+        results['cusum_first_violation'] = first_violation_date
+    else:
+        print("No boundary violations detected (parameters appear stable)")
+        results['cusum_first_violation'] = None
+
+    results['cusum_violations'] = n_violations
+
+    # =========================================================================
+    # STEP 5: GENERATE PLOTS
+    # =========================================================================
+    print("\n" + "-"*80)
+    print("STEP 5: GENERATING DIAGNOSTIC PLOTS")
+    print("-"*80)
+
+    # Plot 1: Coefficient evolution with detected breaks
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12))
+
+    # Panel A: Rolling coefficient with breaks
+    ax1 = axes[0]
+    midpoints = pd.to_datetime(rolling_df['midpoint'])
+    beta_values = rolling_df['beta_wind'].values
+    se_values = rolling_df['se_wind'].values
+
+    ax1.plot(midpoints, beta_values, color='blue', linewidth=2, label=r'$\beta_{wind}$')
+    ax1.fill_between(midpoints, beta_values - 1.96*se_values, beta_values + 1.96*se_values,
+                     color='blue', alpha=0.2, label='95% CI')
+    ax1.axhline(y=0, color='black', linestyle='--', linewidth=0.8, alpha=0.5)
+
+    # Mark detected breaks
+    for i, break_date in enumerate(detected_break_dates):
+        ax1.axvline(x=break_date, color='red', linestyle='--', linewidth=2,
+                    label='Detected break' if i == 0 else None)
+
+    # Mark known event dates
+    if known_break_dates:
+        for i, date_str in enumerate(known_break_dates):
+            ax1.axvline(x=pd.to_datetime(date_str), color='orange', linestyle=':',
+                        linewidth=2, label='Known event' if i == 0 else None)
+
+    ax1.set_title(f'Wind Coefficient Evolution with Structural Breaks - {zone}', fontsize=12, fontweight='bold')
+    ax1.set_xlabel('Date')
+    ax1.set_ylabel(r'$\beta_{wind}$')
+    ax1.legend(loc='best')
+    ax1.grid(True, alpha=0.3)
+
+    # Panel B: BIC by number of breaks
+    ax2 = axes[1]
+    if results['bic_scores']:
+        bic_df = pd.DataFrame(results['bic_scores'])
+        ax2.bar(bic_df['n_breaks'], bic_df['bic'], color='steelblue', edgecolor='black')
+        ax2.axvline(x=results['optimal_n_breaks'], color='red', linestyle='--',
+                    linewidth=2, label=f'Optimal: {results["optimal_n_breaks"]} breaks')
+        ax2.set_xlabel('Number of Breaks')
+        ax2.set_ylabel('BIC')
+        ax2.set_title('Model Selection: BIC by Number of Breaks', fontsize=12, fontweight='bold')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3, axis='y')
+    else:
+        ax2.text(0.5, 0.5, 'BIC analysis not available\n(ruptures package not installed)',
+                 ha='center', va='center', transform=ax2.transAxes, fontsize=12)
+        ax2.set_title('Model Selection: BIC by Number of Breaks', fontsize=12, fontweight='bold')
+
+    # Panel C: CUSUM plot
+    ax3 = axes[2]
+    ax3.plot(recursive_dates, cusum, color='blue', linewidth=1.5, label='CUSUM')
+    ax3.plot(recursive_dates, upper_bound, color='red', linestyle='--', linewidth=1.5, label='5% bounds')
+    ax3.plot(recursive_dates, lower_bound, color='red', linestyle='--', linewidth=1.5)
+    ax3.fill_between(recursive_dates, lower_bound, upper_bound, color='red', alpha=0.1)
+    ax3.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax3.set_xlabel('Date')
+    ax3.set_ylabel('CUSUM')
+    ax3.set_title('CUSUM Test for Parameter Stability', fontsize=12, fontweight='bold')
+    ax3.legend(loc='best')
+    ax3.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = os.path.join(zone_plots_dir, f'sb_{config_label}_{zone}.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"Saved plot: {plot_path}")
+    plt.close()
+
+    # =========================================================================
+    # STEP 6: SAVE RESULTS
+    # =========================================================================
+    print("\n" + "-"*80)
+    print("STEP 6: SAVING RESULTS")
+    print("-"*80)
+
+    # Save rolling coefficients
+    rolling_csv = os.path.join(zone_results_dir, f'sb_rolling_coef_{config_label}_{zone}.csv')
+    rolling_df.to_csv(rolling_csv, index=False)
+    print(f"Saved rolling coefficients: {rolling_csv}")
+
+    # Save Chow test results
+    if chow_results:
+        chow_df = pd.DataFrame(chow_results)
+        chow_csv = os.path.join(zone_results_dir, f'sb_chow_tests_{config_label}_{zone}.csv')
+        chow_df.to_csv(chow_csv, index=False)
+        print(f"Saved Chow test results: {chow_csv}")
+
+    # Save summary
+    summary_path = os.path.join(zone_results_dir, f'sb_summary_{config_label}_{zone}.txt')
+    with open(summary_path, 'w') as f:
+        f.write("="*80 + "\n")
+        f.write(f"STRUCTURAL BREAK ANALYSIS SUMMARY - {zone}\n")
+        f.write("="*80 + "\n\n")
+
+        f.write(f"Configuration:\n")
+        f.write(f"  Config label: {config_label}\n")
+        f.write(f"  Rolling window: {window_years} year(s)\n")
+        if step_months:
+            f.write(f"  Step size: {step_months} month(s)\n")
+        else:
+            f.write(f"  Step size: {step_years} year(s)\n")
+        f.write(f"  Minimum observations per window: {min_obs:,}\n\n")
+
+        f.write(f"Data range: {tmp.index.min()} to {tmp.index.max()}\n")
+        f.write(f"Total observations: {n_obs:,}\n\n")
+
+        f.write("-"*80 + "\n")
+        f.write("BAI-PERRON BREAK DETECTION\n")
+        f.write("-"*80 + "\n")
+        if results['optimal_n_breaks'] is not None:
+            f.write(f"Optimal number of breaks (BIC): {results['optimal_n_breaks']}\n")
+            if detected_break_dates:
+                f.write("Detected break dates:\n")
+                for bd in detected_break_dates:
+                    f.write(f"  - {bd.strftime('%Y-%m-%d')}\n")
+            else:
+                f.write("No breaks detected.\n")
+        else:
+            f.write("Bai-Perron analysis not available (ruptures not installed)\n")
+
+        f.write("\n" + "-"*80 + "\n")
+        f.write("CHOW TEST RESULTS\n")
+        f.write("-"*80 + "\n")
+        for cr in chow_results:
+            f.write(f"\nBreak date: {cr['break_date'].strftime('%Y-%m-%d')} ({cr['source']})\n")
+            f.write(f"  Pre-break beta_wind:  {cr['beta_wind_pre']:.4f} (SE={cr['se_pre']:.4f})\n")
+            f.write(f"  Post-break beta_wind: {cr['beta_wind_post']:.4f} (SE={cr['se_post']:.4f})\n")
+            f.write(f"  Change: {cr['beta_change']:.4f} ({cr['beta_change_pct']:.1f}%)\n")
+            f.write(f"  F-statistic: {cr['f_statistic']:.2f}, p-value: {cr['p_value']:.4e}\n")
+            f.write(f"  Significant at 5%: {'YES' if cr['significant_5pct'] else 'NO'}\n")
+
+        f.write("\n" + "-"*80 + "\n")
+        f.write("CUSUM TEST\n")
+        f.write("-"*80 + "\n")
+        f.write(f"Boundary violations: {results['cusum_violations']}\n")
+        if results['cusum_first_violation']:
+            f.write(f"First violation: {results['cusum_first_violation']}\n")
+        else:
+            f.write("No violations (parameters appear stable)\n")
+
+    print(f"Saved summary: {summary_path}")
+
+    # =========================================================================
+    # FINAL SUMMARY
+    # =========================================================================
+    print("\n" + "="*80)
+    print("STRUCTURAL BREAK ANALYSIS COMPLETE")
+    print("="*80)
+
+    print(f"\nKey findings for {zone}:")
+    if results['optimal_n_breaks'] is not None:
+        print(f"  - Detected {results['optimal_n_breaks']} structural break(s) via Bai-Perron")
+    if chow_results:
+        sig_chow = sum(1 for cr in chow_results if cr['significant_5pct'])
+        print(f"  - {sig_chow}/{len(chow_results)} break dates significant at 5% (Chow test)")
+    print(f"  - CUSUM violations: {results['cusum_violations']}")
+
+    return results
+
+
+def run_trend_break_analysis(df, zone, Y, exog_vars,
+                             max_breaks=5, min_segment_pct=0.10,
+                             trimming=0.15,
+                             window_years=1, step_years=1/12,
+                             min_obs=24*365 - 24*30,
+                             config_label=None,
+                             plots_dir="plots", results_dir="results", show_progress=True):
+    """
+    Detect structural breaks in the TREND of wind coefficient using SEQUENTIAL TESTING.
+
+    This function tests for changes in the SLOPE of coefficient evolution over time,
+    using sequential hypothesis testing (0 vs 1 break, 1 vs 2 breaks, etc.).
+
+    Methodology:
+    1. Estimate rolling window coefficients
+    2. For m = 0, 1, 2, ..., max_breaks:
+       - Find optimal break locations using dynamic programming
+       - Calculate BIC and F-statistic for m vs m-1 breaks
+    3. Select optimal number of breaks via BIC
+    4. Perform sequential F-tests for significance
+
+    Parameters:
+    - df: DataFrame with all variables
+    - zone: Price zone identifier
+    - Y: Dependent variable (Series)
+    - exog_vars: List of exogenous variable column names
+    - max_breaks: Maximum number of trend breaks to test (default: 5)
+    - min_segment_pct: Minimum segment length as fraction of total windows (default: 0.10)
+    - trimming: Fraction of data to trim from endpoints (default 0.15)
+    - window_years: Rolling window size in years (default 1)
+    - step_years: Step size between windows in years (default 1/12 = 1 month)
+    - min_obs: Minimum observations required per window (default 24*365 - 24*30)
+    - config_label: Custom label for this configuration (auto-generated if None)
+    - plots_dir: Directory for saving plots
+    - results_dir: Directory for saving results
+    - show_progress: Whether to show progress indicators
+
+    Returns:
+    - Dictionary with trend break detection results
+    """
+    from dateutil.relativedelta import relativedelta
+
+    # Generate config label if not provided
+    if config_label is None:
+        step_months_label = int(round(step_years * 12)) if step_years < 1 else None
+        if window_years == int(window_years):
+            window_label = f"{int(window_years)}y"
+        else:
+            window_label = f"{window_years:.1f}y"
+        if step_months_label:
+            step_label = f"{step_months_label}m"
+        else:
+            step_label = f"{int(step_years)}y" if step_years == int(step_years) else f"{step_years:.1f}y"
+
+        config_label = f"{window_label}_window_{step_label}_step_trend"
+
+    step_months = int(round(step_years * 12)) if step_years < 1 else None
+
+    print("\n" + "="*80)
+    print("SEQUENTIAL TREND BREAK ANALYSIS")
+    print("="*80)
+
+    # Identify wind column
+    wind_col = [col for col in exog_vars if 'Wind' in col and 'Forecast' in col][0]
+
+    print(f"\nConfiguration:")
+    print(f"  Zone: {zone}")
+    print(f"  Config label: {config_label}")
+    print(f"  Target coefficient: {wind_col}")
+    print(f"  Rolling window: {window_years} year(s)")
+    if step_months:
+        print(f"  Step size: {step_months} month(s)")
+    else:
+        print(f"  Step size: {step_years} year(s)")
+    print(f"  Minimum observations per window: {min_obs:,}")
+    print(f"  Maximum breaks to test: {max_breaks}")
+    print(f"  Minimum segment: {min_segment_pct*100:.0f}% of windows")
+    print(f"  Trimming (endpoints): {trimming*100:.0f}%")
+
+    # Prepare clean data
+    cols_needed = [Y.name] + exog_vars
+    tmp = df[cols_needed].dropna().copy()
+    tmp = tmp.sort_index()
+
+    n_obs = len(tmp)
+    print(f"\nData range: {tmp.index.min()} to {tmp.index.max()}")
+    print(f"Total observations: {n_obs:,}")
+
+    # Create output directories
+    zone_plots_dir = os.path.join(plots_dir, zone, "trend_break_analysis")
+    os.makedirs(zone_plots_dir, exist_ok=True)
+
+    zone_results_dir = os.path.join(results_dir, "trend_break_analysis")
+    os.makedirs(zone_results_dir, exist_ok=True)
+
+    # =========================================================================
+    # STEP 1: ROLLING WINDOW ESTIMATION
+    # =========================================================================
+    print("\n" + "-"*80)
+    print("STEP 1: ESTIMATING ROLLING WINDOW COEFFICIENTS")
+    print("-"*80)
+
+    rolling_results = []
+    start_date = tmp.index.min()
+    end_of_data = tmp.index.max()
+    current_start = start_date
+
+    while current_start <= end_of_data:
+        window_end = current_start + relativedelta(years=window_years)
+        window_data = tmp[(tmp.index >= current_start) & (tmp.index < window_end)]
+
+        if len(window_data) >= min_obs:
+            X = sm.add_constant(window_data[exog_vars])
+            y = window_data[Y.name]
+            model = sm.OLS(y, X).fit(cov_type='HAC', cov_kwds={'maxlags': 24})
+
+            midpoint = current_start + relativedelta(months=window_years * 6)
+
+            rolling_results.append({
+                'midpoint': midpoint,
+                'beta_wind': model.params[wind_col],
+                'se_wind': model.bse[wind_col]
+            })
+
+        if step_months:
+            current_start = current_start + relativedelta(months=step_months)
+        else:
+            current_start = current_start + relativedelta(years=int(step_years))
+
+    rolling_df = pd.DataFrame(rolling_results)
+    rolling_df['time_idx'] = np.arange(len(rolling_df))
+    n_windows = len(rolling_df)
+
+    print(f"Estimated {n_windows} rolling window coefficients")
+    print(f"Coefficient range: [{rolling_df['beta_wind'].min():.4f}, {rolling_df['beta_wind'].max():.4f}]")
+
+    # Minimum segment length
+    min_segment = max(int(n_windows * min_segment_pct), 5)
+    print(f"Minimum segment length: {min_segment} windows")
+
+    # =========================================================================
+    # STEP 2: HELPER FUNCTIONS FOR SEGMENTED REGRESSION
+    # =========================================================================
+
+    def fit_segment(data):
+        """Fit linear trend to a segment, return RSS and model"""
+        if len(data) < 3:
+            return np.inf, None
+        X = sm.add_constant(data['time_idx'])
+        y = data['beta_wind']
+        model = sm.OLS(y, X).fit()
+        return model.ssr, model
+
+    def find_optimal_breaks_dp(n_breaks):
+        """
+        Find optimal break locations for exactly n_breaks using dynamic programming.
+        Returns: (break_indices, total_rss, segment_models)
+        """
+        if n_breaks == 0:
+            rss, model = fit_segment(rolling_df)
+            return [], rss, [model]
+
+        # Trim indices
+        trim_n = int(n_windows * trimming)
+
+        # Dynamic programming approach
+        # Cost[i][k] = minimum RSS for first i observations with k breaks
+        # We need to find k break points that partition [0, n) into k+1 segments
+
+        # For simplicity with small max_breaks, use recursive search with memoization
+        best_breaks = None
+        best_rss = np.inf
+        best_models = None
+
+        def get_segment_rss(start, end):
+            """Get RSS for segment [start, end)"""
+            if end - start < 3:
+                return np.inf, None
+            segment_data = rolling_df.iloc[start:end]
+            return fit_segment(segment_data)
+
+        def search_breaks(remaining_breaks, start_idx, current_breaks):
+            """Recursive search for optimal break locations"""
+            nonlocal best_breaks, best_rss, best_models
+
+            if remaining_breaks == 0:
+                # No more breaks to place, fit final segment
+                rss_final, model_final = get_segment_rss(start_idx, n_windows)
+                if model_final is None:
+                    return
+
+                # Calculate total RSS
+                total_rss = 0
+                models = []
+                prev_idx = 0
+                for brk in current_breaks:
+                    rss_seg, model_seg = get_segment_rss(prev_idx, brk)
+                    if model_seg is None:
+                        return
+                    total_rss += rss_seg
+                    models.append(model_seg)
+                    prev_idx = brk
+                total_rss += rss_final
+                models.append(model_final)
+
+                if total_rss < best_rss:
+                    best_rss = total_rss
+                    best_breaks = current_breaks.copy()
+                    best_models = models
+                return
+
+            # Try placing next break
+            # Break can be placed from (start_idx + min_segment) to (n_windows - remaining_breaks*min_segment - min_segment)
+            earliest = max(start_idx + min_segment, trim_n)
+            latest = n_windows - remaining_breaks * min_segment - min_segment
+            latest = min(latest, n_windows - trim_n)
+
+            for brk in range(earliest, latest + 1):
+                current_breaks.append(brk)
+                search_breaks(remaining_breaks - 1, brk, current_breaks)
+                current_breaks.pop()
+
+        search_breaks(n_breaks, 0, [])
+
+        return best_breaks if best_breaks else [], best_rss, best_models
+
+    # =========================================================================
+    # STEP 3: SEQUENTIAL TESTING
+    # =========================================================================
+    print("\n" + "-"*80)
+    print("STEP 2: SEQUENTIAL TREND BREAK TESTING")
+    print("-"*80)
+
+    model_results = []
+
+    for m in range(0, max_breaks + 1):
+        print(f"\n--- Testing {m} break(s) ---")
+
+        breaks, rss, models = find_optimal_breaks_dp(m)
+
+        if models is None or rss == np.inf:
+            print(f"  Could not fit model with {m} breaks (insufficient segment length)")
+            break
+
+        # Calculate BIC
+        k = 2 * (m + 1)  # Each segment has intercept + slope
+        bic = n_windows * np.log(rss / n_windows) + k * np.log(n_windows)
+
+        # Get break dates
+        break_dates = [rolling_df.iloc[b]['midpoint'] for b in breaks] if breaks else []
+
+        # Extract slopes for each segment
+        slopes = []
+        for i, model in enumerate(models):
+            slope = model.params['time_idx']
+            se = model.bse['time_idx']
+            slopes.append({'slope': slope, 'se': se})
+
+        print(f"  Break locations: {breaks if breaks else 'None'}")
+        if break_dates:
+            print(f"  Break dates: {[d.strftime('%Y-%m-%d') for d in break_dates]}")
+        print(f"  RSS: {rss:.4f}")
+        print(f"  BIC: {bic:.2f}")
+        slopes_str = [f"{s['slope']:.6f}" for s in slopes]
+        print(f"  Segment slopes: {slopes_str}")
+
+        model_results.append({
+            'n_breaks': m,
+            'breaks': breaks,
+            'break_dates': break_dates,
+            'rss': rss,
+            'bic': bic,
+            'models': models,
+            'slopes': slopes
+        })
+
+    # =========================================================================
+    # STEP 4: SEQUENTIAL F-TESTS
+    # =========================================================================
+    print("\n" + "-"*80)
+    print("STEP 3: SEQUENTIAL F-TESTS (m vs m+1 breaks)")
+    print("-"*80)
+
+    f_test_results = []
+
+    for i in range(len(model_results) - 1):
+        m0 = model_results[i]
+        m1 = model_results[i + 1]
+
+        rss0 = m0['rss']
+        rss1 = m1['rss']
+        k0 = 2 * (m0['n_breaks'] + 1)
+        k1 = 2 * (m1['n_breaks'] + 1)
+
+        # F-statistic: (RSS0 - RSS1) / (k1 - k0) / (RSS1 / (n - k1))
+        if rss1 > 0 and (k1 - k0) > 0:
+            f_stat = ((rss0 - rss1) / (k1 - k0)) / (rss1 / (n_windows - k1))
+            p_value = 1 - stats.f.cdf(f_stat, k1 - k0, n_windows - k1)
+        else:
+            f_stat = np.nan
+            p_value = np.nan
+
+        result = {
+            'test': f"{m0['n_breaks']} vs {m1['n_breaks']} breaks",
+            'f_stat': f_stat,
+            'p_value': p_value,
+            'significant_5pct': p_value < 0.05 if not np.isnan(p_value) else False,
+            'significant_1pct': p_value < 0.01 if not np.isnan(p_value) else False
+        }
+        f_test_results.append(result)
+
+        sig_5 = "YES" if result['significant_5pct'] else "NO"
+        sig_1 = "YES" if result['significant_1pct'] else "NO"
+        print(f"\n  {m0['n_breaks']} vs {m1['n_breaks']} breaks:")
+        print(f"    F-statistic: {f_stat:.2f}")
+        print(f"    p-value: {p_value:.4e}")
+        print(f"    Significant at 5%: {sig_5}")
+        print(f"    Significant at 1%: {sig_1}")
+
+    # =========================================================================
+    # STEP 5: MODEL SELECTION
+    # =========================================================================
+    print("\n" + "-"*80)
+    print("STEP 4: MODEL SELECTION SUMMARY")
+    print("-"*80)
+
+    # BIC-based selection
+    bic_values = [m['bic'] for m in model_results]
+    optimal_by_bic = np.argmin(bic_values)
+    optimal_model = model_results[optimal_by_bic]
+
+    print(f"\n  BIC comparison:")
+    for m in model_results:
+        marker = " <-- OPTIMAL" if m['n_breaks'] == optimal_model['n_breaks'] else ""
+        print(f"    {m['n_breaks']} breaks: BIC = {m['bic']:.2f}{marker}")
+
+    # Sequential testing selection (stop when F-test is not significant)
+    optimal_by_seq = 0
+    for i, f_result in enumerate(f_test_results):
+        if f_result['significant_5pct']:
+            optimal_by_seq = i + 1
+        else:
+            break
+
+    print(f"\n  Optimal by BIC: {optimal_model['n_breaks']} break(s)")
+    print(f"  Optimal by sequential F-test (5%): {optimal_by_seq} break(s)")
+
+    # Use BIC-selected model
+    selected_model = optimal_model
+
+    print(f"\n  SELECTED MODEL: {selected_model['n_breaks']} break(s)")
+    if selected_model['break_dates']:
+        print(f"  Break dates: {[d.strftime('%Y-%m-%d') for d in selected_model['break_dates']]}")
+
+    # Print segment details
+    print(f"\n  Segment details:")
+    segment_starts = [0] + selected_model['breaks']
+    segment_ends = selected_model['breaks'] + [n_windows]
+
+    for i, (start, end, slope_info) in enumerate(zip(segment_starts, segment_ends, selected_model['slopes'])):
+        start_date = rolling_df.iloc[start]['midpoint']
+        end_date = rolling_df.iloc[min(end-1, n_windows-1)]['midpoint']
+        print(f"    Segment {i+1}: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+        print(f"      Slope: {slope_info['slope']:.6f} (SE: {slope_info['se']:.6f})")
+
+    # =========================================================================
+    # STEP 6: GENERATE PLOTS
+    # =========================================================================
+    print("\n" + "-"*80)
+    print("STEP 5: GENERATING DIAGNOSTIC PLOTS")
+    print("-"*80)
+
+    fig, ax1 = plt.subplots(1, 1, figsize=(14, 6))
+
+    # Coefficient evolution with segmented trend lines
+    midpoints = pd.to_datetime(rolling_df['midpoint'])
+    beta_values = rolling_df['beta_wind'].values
+
+    ax1.plot(midpoints, beta_values, 'o', color='steelblue', alpha=0.5, markersize=4, label='Rolling coefficients')
+
+    # Plot fitted trend lines for each segment
+    colors = ['green', 'red', 'purple', 'orange', 'brown', 'pink']
+    segment_starts = [0] + selected_model['breaks']
+    segment_ends = selected_model['breaks'] + [n_windows]
+
+    for i, (start, end, model) in enumerate(zip(segment_starts, segment_ends, selected_model['models'])):
+        segment_data = rolling_df.iloc[start:end]
+        X_plot = sm.add_constant(segment_data['time_idx'])
+        y_pred = model.predict(X_plot)
+        segment_midpoints = pd.to_datetime(segment_data['midpoint'])
+        color = colors[i % len(colors)]
+        slope = selected_model['slopes'][i]['slope']
+        ax1.plot(segment_midpoints, y_pred, '-', color=color, linewidth=2.5,
+                 label=f'Segment {i+1} (slope={slope:.4f})')
+
+    # Mark break points
+    for i, break_date in enumerate(selected_model['break_dates']):
+        ax1.axvline(x=break_date, color='red', linestyle='--', linewidth=2,
+                    label='Break' if i == 0 else None)
+
+    ax1.axhline(y=0, color='black', linestyle='--', linewidth=0.8, alpha=0.5)
+    ax1.set_title(f'Wind Coefficient Evolution with {selected_model["n_breaks"]} Trend Break(s) - {zone}',
+                  fontsize=12, fontweight='bold')
+    ax1.set_xlabel('Date')
+    ax1.set_ylabel(r'$\beta_{wind}$')
+    ax1.legend(loc='best')
+    ax1.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = os.path.join(zone_plots_dir, f'tb_{config_label}_{zone}.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"Saved plot: {plot_path}")
+    plt.close()
+
+    # =========================================================================
+    # STEP 7: SAVE RESULTS
+    # =========================================================================
+    print("\n" + "-"*80)
+    print("STEP 6: SAVING RESULTS")
+    print("-"*80)
+
+    # Save rolling coefficients
+    rolling_csv = os.path.join(zone_results_dir, f'tb_rolling_coef_{config_label}_{zone}.csv')
+    rolling_df.to_csv(rolling_csv, index=False)
+    print(f"Saved rolling coefficients: {rolling_csv}")
+
+    # Save model comparison
+    model_comparison = []
+    for m in model_results:
+        row = {
+            'n_breaks': m['n_breaks'],
+            'bic': m['bic'],
+            'rss': m['rss'],
+            'break_dates': ';'.join([d.strftime('%Y-%m-%d') for d in m['break_dates']]) if m['break_dates'] else '',
+            'slopes': ';'.join([f"{s['slope']:.6f}" for s in m['slopes']])
+        }
+        model_comparison.append(row)
+
+    comparison_df = pd.DataFrame(model_comparison)
+    comparison_csv = os.path.join(zone_results_dir, f'tb_model_comparison_{config_label}_{zone}.csv')
+    comparison_df.to_csv(comparison_csv, index=False)
+    print(f"Saved model comparison: {comparison_csv}")
+
+    # Save F-test results
+    ftest_df = pd.DataFrame(f_test_results)
+    ftest_csv = os.path.join(zone_results_dir, f'tb_ftest_results_{config_label}_{zone}.csv')
+    ftest_df.to_csv(ftest_csv, index=False)
+    print(f"Saved F-test results: {ftest_csv}")
+
+    # Save summary
+    summary_path = os.path.join(zone_results_dir, f'tb_summary_{config_label}_{zone}.txt')
+    with open(summary_path, 'w') as f:
+        f.write("="*80 + "\n")
+        f.write(f"SEQUENTIAL TREND BREAK ANALYSIS SUMMARY - {zone}\n")
+        f.write("="*80 + "\n\n")
+
+        f.write(f"Configuration:\n")
+        f.write(f"  Config label: {config_label}\n")
+        f.write(f"  Rolling window: {window_years} year(s)\n")
+        if step_months:
+            f.write(f"  Step size: {step_months} month(s)\n")
+        else:
+            f.write(f"  Step size: {step_years} year(s)\n")
+        f.write(f"  Minimum observations per window: {min_obs:,}\n")
+        f.write(f"  Maximum breaks tested: {max_breaks}\n\n")
+
+        f.write(f"Data: {n_windows} rolling windows\n\n")
+
+        f.write("-"*80 + "\n")
+        f.write("MODEL COMPARISON (BIC)\n")
+        f.write("-"*80 + "\n")
+        for m in model_results:
+            marker = " <-- SELECTED" if m['n_breaks'] == selected_model['n_breaks'] else ""
+            f.write(f"  {m['n_breaks']} breaks: BIC = {m['bic']:.2f}{marker}\n")
+
+        f.write("\n" + "-"*80 + "\n")
+        f.write("SEQUENTIAL F-TESTS\n")
+        f.write("-"*80 + "\n")
+        for r in f_test_results:
+            f.write(f"  {r['test']}: F = {r['f_stat']:.2f}, p = {r['p_value']:.4e}\n")
+            f.write(f"    Significant at 5%: {'YES' if r['significant_5pct'] else 'NO'}\n")
+
+        f.write("\n" + "-"*80 + "\n")
+        f.write("SELECTED MODEL\n")
+        f.write("-"*80 + "\n")
+        f.write(f"Number of breaks: {selected_model['n_breaks']}\n")
+        if selected_model['break_dates']:
+            f.write(f"Break dates: {[d.strftime('%Y-%m-%d') for d in selected_model['break_dates']]}\n")
+
+        f.write("\nSegment details:\n")
+        for i, slope_info in enumerate(selected_model['slopes']):
+            f.write(f"  Segment {i+1}: slope = {slope_info['slope']:.6f} (SE: {slope_info['se']:.6f})\n")
+
+    print(f"Saved summary: {summary_path}")
+
+    # =========================================================================
+    # FINAL SUMMARY
+    # =========================================================================
+    print("\n" + "="*80)
+    print("SEQUENTIAL TREND BREAK ANALYSIS COMPLETE")
+    print("="*80)
+
+    print(f"\nKey findings for {zone}:")
+    print(f"  - Optimal breaks (BIC): {selected_model['n_breaks']}")
+    if selected_model['break_dates']:
+        print(f"  - Break dates: {[d.strftime('%Y-%m-%d') for d in selected_model['break_dates']]}")
+    slopes_final = [f"{s['slope']:.6f}" for s in selected_model['slopes']]
+    print(f"  - Segment slopes: {slopes_final}")
+
+    # Return results
+    results = {
+        'zone': zone,
+        'config_label': config_label,
+        'n_windows': n_windows,
+        'model_results': model_results,
+        'f_test_results': f_test_results,
+        'selected_model': selected_model,
+        'optimal_by_bic': optimal_by_bic,
+        'optimal_by_seq': optimal_by_seq,
+        'rolling_df': rolling_df
+    }
+
+    return results
+
+
+def run_quantile_regression_analysis(df, zone,
+                                     plots_dir="plots", results_dir="results"):
+    """
+    Estimate wind coefficient across quantiles of the price distribution.
+
+    Uses logged variables (NOT deseasonalized) with calendar dummies included directly
+    in the regression to control for seasonality (FULL basis: Year+Month+DOW+Hour+Holiday).
+
+    Note: Always uses logged variables.
+
+    Parameters:
+    - df: DataFrame with all variables
+    - zone: Price zone identifier
     - plots_dir: Directory for saving plots
     - results_dir: Directory for saving CSV results
 
@@ -1513,58 +2585,21 @@ def run_quantile_regression_analysis(df, zone, use_log_transform,
     print("QUANTILE REGRESSION ANALYSIS")
     print("="*80)
 
-    # --- Step 1: Determine dependent variable (raw/log, NOT deseasonalized) ---
-    if use_log_transform and 'Price_Log' in df.columns:
-        y_col = 'Price_Log'
-    else:
-        y_col = 'Price'
+    # --- Step 1: Determine dependent variable (logged, NOT deseasonalized) ---
+    y_col = 'Price_Log'
 
     print(f"\nDependent variable: {y_col}")
-    print("  (Using raw/log price, NOT deseasonalized - seasonality handled via dummies)")
+    print("  (Using logged price, NOT deseasonalized - seasonality handled via dummies)")
 
-    # --- Step 2: Determine economic regressors (raw/log, NOT deseasonalized) ---
-    econ_vars = []
-
-    # Wind (required)
-    if use_log_transform and 'Wind_Forecast_Log' in df.columns:
-        wind_col = 'Wind_Forecast_Log'
-    else:
-        wind_col = 'Wind_Forecast'
-    econ_vars.append(wind_col)
-
-    # Consumption/Demand (required)
-    if use_log_transform and 'Consumption_Log' in df.columns:
-        demand_col = 'Consumption_Log'
-    else:
-        demand_col = 'Consumption'
-    econ_vars.append(demand_col)
-
-    # Hydro reserves (required)
-    if use_log_transform and 'Hydro_Reserves_Log' in df.columns:
-        hydro_col = 'Hydro_Reserves_Log'
-    else:
-        hydro_col = 'Hydro_Reserves'
-    econ_vars.append(hydro_col)
-
-    # Net exchange (optional)
-    if 'Net_Exchange' in df.columns:
-        econ_vars.append('Net_Exchange')
-    else:
-        print("  Note: 'Net_Exchange' not found, skipping")
-
-    # Oil price (always included)
-    if use_log_transform:
-        oil_col = 'Oil_Price_Log'
-    else:
-        oil_col = 'Oil_Price'
-    econ_vars.append(oil_col)
-
-    # Gas price (always included)
-    if use_log_transform:
-        gas_col = 'Gas_Price_Log'
-    else:
-        gas_col = 'Gas_Price'
-    econ_vars.append(gas_col)
+    # --- Step 2: Determine economic regressors (logged, NOT deseasonalized) ---
+    econ_vars = [
+        'Wind_Forecast_Log',
+        'Consumption_Log',
+        'Hydro_Reserves_Log',
+        'Net_Exchange',  # NOT logged
+        'Oil_Price_Log',
+        'Gas_Price_Log'
+    ]
 
     print(f"\nEconomic regressors: {econ_vars}")
 
@@ -1772,7 +2807,7 @@ def run_quantile_regression_analysis(df, zone, use_log_transform,
     print("="*80)
 
 
-def select_armax_lags_aic(Y, exog_vars, max_p=10, max_q=10, show_progress=True):
+def select_armax_lags_aic(Y, exog_vars, max_p=10, max_q=10):
     """
     Automated lag selection for ARMAX model using AIC minimization.
 
@@ -1783,7 +2818,6 @@ def select_armax_lags_aic(Y, exog_vars, max_p=10, max_q=10, show_progress=True):
     """
     print("\n--- ARMAX LAG SELECTION VIA AIC MINIMIZATION ---")
     print(f"Testing AR lags (p): 1-{max_p}, MA lags (q): 1-{max_q}")
-    print("This may take several minutes...")
     print("="*80)
 
     best_aic = np.inf
@@ -1842,8 +2876,7 @@ def select_armax_lags_aic_checkpointed(Y, exog_vars, zone='SE1',
                                         max_p=10, max_q=10,
                                         checkpoint_file=None,
                                         ljungbox_lags=[5, 10, 15, 20],
-                                        save_interval=1,
-                                        show_progress=True):
+                                        save_interval=1):
     """
     Automated lag selection with checkpointing and Ljung-Box diagnostics.
 
@@ -1860,7 +2893,6 @@ def select_armax_lags_aic_checkpointed(Y, exog_vars, zone='SE1',
     - checkpoint_file: Path to checkpoint file (auto-generated if None)
     - ljungbox_lags: Lags to test in Ljung-Box test
     - save_interval: Save checkpoint every N models (default 1 = every model)
-    - show_progress: Show progress bar
 
     Returns:
     - best_order: Tuple (p, q) with lowest AIC among models that pass Ljung-Box
@@ -1890,7 +2922,6 @@ def select_armax_lags_aic_checkpointed(Y, exog_vars, zone='SE1',
         completed_specs = set()
         print("Starting fresh (no existing checkpoint found)")
 
-    print("\nThis may take several minutes...")
     print("="*80)
 
     # Count models to test
@@ -1954,7 +2985,7 @@ def select_armax_lags_aic_checkpointed(Y, exog_vars, zone='SE1',
                     result_row['status'] = 'completed'
 
                     # Print result
-                    lb_status = "✓ PASS" if result_row['passes_ljungbox'] else "✗ FAIL"
+                    lb_status = "PASS" if result_row['passes_ljungbox'] else "FAIL"
                     print(f"AIC={result_row['aic']:.2f}, Ljung-Box: {lb_status}")
 
             except Exception as e:
@@ -2012,7 +3043,7 @@ def select_armax_lags_aic_checkpointed(Y, exog_vars, zone='SE1',
     top_valid = valid_models.nsmallest(10, 'aic')
     for idx, (_, row) in enumerate(top_valid.iterrows(), 1):
         model_name = f"ARMAX({int(row['p'])},{int(row['q'])})"
-        lb_pass = "✓" if row['passes_ljungbox'] else "✗"
+        lb_pass = "PASS" if row['passes_ljungbox'] else "FAIL"
         print(f"{idx:<6} {model_name:<15} {row['aic']:<15.2f} {lb_pass:<10}")
 
     # Print best model details
@@ -2053,10 +3084,7 @@ def fit_garchx_model(armax_residuals, df, wind_var='Wind_Forecast_Log',
     - garch_res: Fitted ARCH model object (or None if fitting fails)
     - diagnostics: Dict with test results (or None)
     """
-    import time
-
     print(f"\n--- Fitting GARCH({p},{q})-X model with {wind_var} in variance equation ---")
-    print("This may take 30-60 seconds...")
 
     try:
         # Align wind variable with residuals index
@@ -2069,8 +3097,6 @@ def fit_garchx_model(armax_residuals, df, wind_var='Wind_Forecast_Log',
             armax_residuals = armax_residuals[valid_idx]
             wind_series = wind_series[valid_idx]
 
-        start_time = time.time()
-
         # Specify GARCH(p,q)-X model
         garch_spec = arch_model(
             armax_residuals,
@@ -2082,9 +3108,6 @@ def fit_garchx_model(armax_residuals, df, wind_var='Wind_Forecast_Log',
 
         # Fit with MLE
         garch_res = garch_spec.fit(disp='off', show_warning=False)
-
-        elapsed_time = time.time() - start_time
-        print(f"GARCH fitting completed in {elapsed_time:.1f} seconds\n")
 
         # Display results
         print(f"\nVARIANCE EQUATION - GARCH({p},{q})-X:")
@@ -2122,24 +3145,29 @@ def fit_garchx_model(armax_residuals, df, wind_var='Wind_Forecast_Log',
         return None, None
 
 
-def perform_multivariate_analysis(df, zone, target_region='SE1', use_log_transform=False, use_deseasonalized=False,
+def perform_multivariate_analysis(df, zone, target_region='SE1',
                                  run_ljungbox=False, run_hetero_tests=False, run_stationarity=False,
                                  optimize_armax_lags=False, use_checkpointed_lag_selection=True,
                                  run_tvp_wind_kalman=False,
                                  run_rolling_window=False, rolling_window_years=3,
                                  rolling_step_years=1, rolling_min_obs=24*180,
-                                 run_quantile_regression=False, show_progress=True):
+                                 run_quantile_regression=False,
+                                 run_structural_break=False, structural_break_type='level',
+                                 structural_break_max_breaks=5,
+                                 structural_break_trimming=0.15, structural_break_known_dates=None,
+                                 structural_break_window_years=1, structural_break_step_years=1/12,
+                                 structural_break_min_obs=24*365 - 24*30):
     """
     Runs OLS, ARMAX, and conditionally GARCH-X with full control variables.
 
     GARCH-X is fitted only if ARCH effects detected in ARMAX residuals (p < 0.05).
 
+    Note: Always uses logged and deseasonalized variables (standard approach).
+
     Parameters:
     - df: DataFrame with all variables
     - zone: Zone identifier for display purposes
     - target_region: Target region for bottleneck dummies (default 'SE1')
-    - use_log_transform: Use logged variables
-    - use_deseasonalized: Use deseasonalized (logged) variables
 
     Returns:
     - ols_model: OLS regression results
@@ -2147,103 +3175,76 @@ def perform_multivariate_analysis(df, zone, target_region='SE1', use_log_transfo
     - garch_res: GARCH-X results (None if not fitted)
     """
     print(f"\n--- RUNNING MULTIVARIATE ANALYSIS ({zone}) ---")
+    print("Using: Logged and Deseasonalized variables (Standard approach)")
 
-    # Determine dependent variable (Y) and exogenous variables based on flags
-    if use_log_transform and use_deseasonalized:
-        print("Using: Logged and Deseasonalized variables (Standard approach)")
+    # Dependent variable: Price_Log_Deseasonalized
+    Y = df['Price_Log_Deseasonalized']
 
-        # Dependent variable: Price_Log_Deseasonalized
-        Y = df['Price_Log_Deseasonalized']
+    # Exogenous variables: deseasonalized logged versions (except Wind and Net_Exchange)
+    exog_vars = [
+        'Wind_Forecast_Log',  # NOT deseasonalized (Fredriksson doesn't deseasonalize wind)
+        'Hydro_Reserves_Log_Deseasonalized',
+        'Net_Exchange',  # NOT logged or deseasonalized
+        'Consumption_Log_Deseasonalized',
+        'Oil_Price_Log_Deseasonalized',
+        'Gas_Price_Log_Deseasonalized'
+    ]
 
-        # Exogenous variables: deseasonalized logged versions (except Wind and Net_Exchange)
-        exog_vars = [
-            'Wind_Forecast_Log',  # NOT deseasonalized (Fredriksson doesn't deseasonalize wind)
-            'Hydro_Reserves_Log_Deseasonalized',
-            'Net_Exchange',  # NOT logged or deseasonalized
-            'Consumption_Log_Deseasonalized'
-        ]
-
-        # Add commodity controls (deseasonalized versions)
-        exog_vars.append('Oil_Price_Log_Deseasonalized')
-        exog_vars.append('Gas_Price_Log_Deseasonalized')
-
-        # Add bottleneck dummies (not transformed - binary variables)
-        trading_partners = TRADING_PARTNERS.get(target_region, [])
-        for partner in trading_partners:
-            bneck_col = f'BNECK_{target_region}_{partner}'
-            if bneck_col in df.columns:
-                exog_vars.append(bneck_col)
-
-    elif use_log_transform:
-        print("Using: Logged variables only (no deseasonalization)")
-
-        # Dependent variable: Price_Log
-        Y = df['Price_Log']
-
-        # Exogenous variables: logged versions
-        exog_vars = [
-            'Wind_Forecast_Log',
-            'Hydro_Reserves_Log',
-            'Net_Exchange',  # NOT logged
-            'Consumption_Log'
-        ]
-
-        # Add commodity controls (logged versions)
-        exog_vars.append('Oil_Price_Log')
-        exog_vars.append('Gas_Price_Log')
-
-        # Add bottleneck dummies (not transformed - binary variables)
-        trading_partners = TRADING_PARTNERS.get(target_region, [])
-        for partner in trading_partners:
-            bneck_col = f'BNECK_{target_region}_{partner}'
-            if bneck_col in df.columns:
-                exog_vars.append(bneck_col)
-
-    else:
-        print("Using: Raw variables (no log transformation or deseasonalization)")
-
-        # Dependent variable: Price
-        Y = df['Price']
-
-        # Exogenous variables: raw versions
-        exog_vars = ['Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']
-
-        # Add commodity controls (raw versions)
-        exog_vars.append('Oil_Price')
-        exog_vars.append('Gas_Price')
-
-        # Add bottleneck dummies (not transformed - binary variables)
-        trading_partners = TRADING_PARTNERS.get(target_region, [])
-        for partner in trading_partners:
-            bneck_col = f'BNECK_{target_region}_{partner}'
-            if bneck_col in df.columns:
-                exog_vars.append(bneck_col)
+    # Add bottleneck dummies (not transformed - binary variables)
+    trading_partners = TRADING_PARTNERS.get(target_region, [])
+    for partner in trading_partners:
+        bneck_col = f'BNECK_{target_region}_{partner}'
+        if bneck_col in df.columns:
+            exog_vars.append(bneck_col)
 
     print(f"Dependent variable: {Y.name}")
     print(f"Exogenous variables: {exog_vars}")
 
     # TVP Kalman Filter mode: run time-varying parameter analysis and return early
     if run_tvp_wind_kalman:
-        run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, use_log_transform, plots_dir="plots")
+        run_tvp_wind_kalman_analysis(df, zone, Y, exog_vars, plots_dir="plots")
         return None, None, None  # Early return, skip OLS/ARMAX
 
     # Rolling-window mode: run rolling window analysis and return early
     if run_rolling_window:
-        run_rolling_window_analysis(df, zone, Y, exog_vars, use_log_transform,
+        run_rolling_window_analysis(df, zone, Y, exog_vars,
                                     window_years=rolling_window_years,
                                     step_years=rolling_step_years,
                                     min_obs=rolling_min_obs,
                                     plots_dir="plots",
-                                    results_dir="results",
-                                    show_progress=show_progress)
+                                    results_dir="results")
         return None, None, None  # Early return, skip OLS/ARMAX
 
     # Quantile regression mode: run quantile regression analysis and return early
     if run_quantile_regression:
-        run_quantile_regression_analysis(df, zone, use_log_transform,
+        run_quantile_regression_analysis(df, zone,
                                          plots_dir="plots",
-                                         results_dir="results",
-                                         show_progress=show_progress)
+                                         results_dir="results")
+        return None, None, None  # Early return, skip OLS/ARMAX
+
+    # Structural break mode: run analysis and return early
+    if run_structural_break:
+        if structural_break_type == 'trend':
+            # Trend break analysis: detects changes in coefficient slope (sequential testing)
+            run_trend_break_analysis(df, zone, Y, exog_vars,
+                                    max_breaks=structural_break_max_breaks,
+                                    trimming=structural_break_trimming,
+                                    window_years=structural_break_window_years,
+                                    step_years=structural_break_step_years,
+                                    min_obs=structural_break_min_obs,
+                                    plots_dir="plots",
+                                    results_dir="results")
+        else:  # 'level' or default
+            # Level break analysis: detects step changes in coefficient mean (Bai-Perron)
+            run_structural_break_analysis(df, zone, Y, exog_vars,
+                                          max_breaks=structural_break_max_breaks,
+                                          trimming=structural_break_trimming,
+                                          known_break_dates=structural_break_known_dates,
+                                          window_years=structural_break_window_years,
+                                          step_years=structural_break_step_years,
+                                          min_obs=structural_break_min_obs,
+                                          plots_dir="plots",
+                                          results_dir="results")
         return None, None, None  # Early return, skip OLS/ARMAX
 
     X = sm.add_constant(df[exog_vars])
@@ -2286,27 +3287,20 @@ def perform_multivariate_analysis(df, zone, target_region='SE1', use_log_transfo
                 Y, df[exog_vars],
                 zone=zone,
                 max_p=10, max_q=10,
-                checkpoint_file=None,  # Auto-generate based on zone
-                show_progress=show_progress
+                checkpoint_file=None  # Auto-generate based on zone
             )
         else:
             # Use original version (no checkpointing)
-            optimal_order = select_armax_lags_aic(Y, df[exog_vars], max_p=10, max_q=10,
-                                                   show_progress=show_progress)
+            optimal_order = select_armax_lags_aic(Y, df[exog_vars], max_p=10, max_q=10)
         armax_order = (optimal_order[0], 0, optimal_order[1])
     else:
         armax_order = (3, 0, 3)
         print(f"Using default ARMAX{armax_order} specification (set OPTIMIZE_ARMAX_LAGS=True for AIC-based selection)")
 
     # Mean Equation (Price Level)
-    print(f"\n--- Fitting ARMAX{armax_order} model (this may take 10-30 seconds) ---")
-    import time
-    start_time = time.time()
+    print(f"\n--- Fitting ARMAX{armax_order} model ---")
 
     armax_res = sm.tsa.ARIMA(Y, exog=df[exog_vars], order=armax_order).fit()
-
-    elapsed_time = time.time() - start_time
-    print(f"ARMAX fitting completed in {elapsed_time:.1f} seconds\n")
 
     print(f"\nMEAN EQUATION (Price Level) - ARMAX{armax_order}:")
     print(armax_res.summary())
@@ -2335,11 +3329,8 @@ def perform_multivariate_analysis(df, zone, target_region='SE1', use_log_transfo
     # GARCH-X component: Fit if ARCH effects confirmed
     garch_res = None
     if arch_detected and FIT_GARCH_IF_ARCH:
-        # Determine wind variable based on transformation flags
-        if use_log_transform:
-            wind_var = 'Wind_Forecast_Log'
-        else:
-            wind_var = 'Wind_Forecast'
+        # Always use logged wind variable
+        wind_var = 'Wind_Forecast_Log'
 
         garch_res, garch_diagnostics = fit_garchx_model(
             armax_res.resid,
@@ -2377,13 +3368,13 @@ def plot_time_series(df, zone, stage='raw', plots_dir='plots'):
     print("\n--- Creating Time Series Plots ---")
     sns.set_style("whitegrid")
 
-    fig, axes = plt.subplots(5, 1, figsize=(16, 20))
+    fig, axes = plt.subplots(6, 1, figsize=(16, 24))
     stage_title = stage.replace('_', ' ').title()
     fig.suptitle(f'{stage_title} Time Series Data - {zone} (2021-2024)', fontsize=16, fontweight='bold')
 
-    variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']
-    colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6']
-    units = ['EUR/MWh', 'MWh', 'MWh', 'MWh', 'MWh']
+    variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption', 'Oil_Price']
+    colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6', '#8B4513']
+    units = ['EUR/MWh', 'MWh', 'MWh', 'MWh', 'MWh', 'EUR/MWh']
 
     for i, (var, color, unit) in enumerate(zip(variables, colors, units)):
         ax = axes[i]
@@ -2429,9 +3420,9 @@ def plot_distributions(df, zone, method='fredriksson', stage='raw', plots_dir='p
     stage_title = stage.replace('_', ' ').title()
     fig.suptitle(f'Distribution of {stage_title} Variables - {zone} (with outlier detection)', fontsize=16, fontweight='bold')
 
-    variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']
-    colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6']
-    units = ['EUR/MWh', 'MWh', 'MWh', 'MWh', 'MWh']
+    variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption', 'Oil_Price']
+    colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6', '#8B4513']
+    units = ['EUR/MWh', 'MWh', 'MWh', 'MWh', 'MWh', 'EUR/MWh']
 
     axes = axes.flatten()
 
@@ -2479,9 +3470,6 @@ def plot_distributions(df, zone, method='fredriksson', stage='raw', plots_dir='p
                 fontsize=9, verticalalignment='top', horizontalalignment='right',
                 bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7))
 
-    # Hide the last subplot if not used
-    axes[-1].axis('off')
-
     plt.tight_layout()
 
     # Save to plots directory
@@ -2496,13 +3484,13 @@ def plot_boxplots(df, zone, stage='raw', plots_dir='plots'):
 
     print("\n--- Creating Box Plots ---")
 
-    fig, axes = plt.subplots(1, 5, figsize=(20, 6))
+    fig, axes = plt.subplots(1, 6, figsize=(24, 6))
     stage_title = stage.replace('_', ' ').title()
     fig.suptitle(f'Box Plots for Outlier Detection - {zone} ({stage_title} Data)', fontsize=16, fontweight='bold')
 
-    variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']
-    colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6']
-    units = ['EUR/MWh', 'MWh', 'MWh', 'MWh', 'MWh']
+    variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption', 'Oil_Price']
+    colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6', '#8B4513']
+    units = ['EUR/MWh', 'MWh', 'MWh', 'MWh', 'MWh', 'EUR/MWh']
 
     for i, (var, color, unit) in enumerate(zip(variables, colors, units)):
         ax = axes[i]
@@ -2575,7 +3563,7 @@ def detect_outliers(df, zone, method='fredriksson', plots_dir='plots'):
     else:
         raise ValueError(f"Unknown method: {method}. Choose 'fredriksson' or 'gianfreda'.")
 
-    variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']
+    variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption', 'Oil_Price']
 
     outlier_summary = []
 
@@ -2646,14 +3634,14 @@ def plot_outliers_timeline(df, zone, method='fredriksson', stage='raw', plots_di
     else:
         raise ValueError(f"Unknown method: {method}")
 
-    fig, axes = plt.subplots(5, 1, figsize=(16, 20))
+    fig, axes = plt.subplots(6, 1, figsize=(16, 24))
     stage_title = stage.replace('_', ' ').title()
     fig.suptitle(f'Time Series with Detected Outliers - {zone} ({method_label} Methodology, {stage_title})',
                  fontsize=16, fontweight='bold')
 
-    variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']
-    colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6']
-    units = ['EUR/MWh', 'MWh', 'MWh', 'MWh', 'MWh']
+    variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption', 'Oil_Price']
+    colors = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6', '#8B4513']
+    units = ['EUR/MWh', 'MWh', 'MWh', 'MWh', 'MWh', 'EUR/MWh']
 
     for i, (var, color, unit) in enumerate(zip(variables, colors, units)):
         ax = axes[i]
@@ -2704,7 +3692,7 @@ def plot_scatter_matrix(df, zone, stage='raw', plots_dir='plots'):
     print("\n--- Creating Scatter Plot Matrix ---")
 
     # Select variables for scatter matrix
-    variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']
+    variables = ['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption', 'Oil_Price']
 
     # Sample data if too large (for performance)
     if len(df) > 5000:
@@ -2767,7 +3755,7 @@ def run_visualizations(data, zone, method='fredriksson', stage='raw', plots_dir=
     print("\n" + "="*80)
     print(f"DESCRIPTIVE STATISTICS ({stage_title.upper()} DATA)")
     print("="*80)
-    print(data[['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption']].describe())
+    print(data[['Price', 'Wind_Forecast', 'Hydro_Reserves', 'Net_Exchange', 'Consumption', 'Oil_Price']].describe())
 
     # Detect outliers using specified methodology
     outlier_summary = detect_outliers(data, zone, method=method, plots_dir=zone_plots_dir)
@@ -2798,6 +3786,177 @@ def run_visualizations(data, zone, method='fredriksson', stage='raw', plots_dir=
     print(f"  6. outlier_summary_{method}_{stage}_{zone}.csv - Outlier detection statistics")
 
 
+def export_data_for_R(data, zone, use_log_transform=False, use_deseasonalized=False,
+                      handle_outliers=False, outlier_method='fredriksson',
+                      negative_price_handling='clip', use_interpolation=False,
+                      export_dir='data_for_R'):
+    """
+    Export fully processed regression data to CSV for R structural break analysis.
+
+    This function exports the cleaned, transformed, and regression-ready data for use
+    with R's strucchange package (Bai-Perron structural break tests).
+
+    Parameters:
+    - data: DataFrame with all processed variables (indexed by Datetime)
+    - zone: Zone identifier (e.g., 'SE1', 'SE2')
+    - use_log_transform: Whether log transformation was applied
+    - use_deseasonalized: Whether deseasonalization was applied
+    - handle_outliers: Whether outlier handling was applied
+    - outlier_method: Method used for outlier handling
+    - negative_price_handling: Method used for negative price handling
+    - use_interpolation: Whether interpolation was used for missing values
+    - export_dir: Directory to save exported files (default: 'data_for_R')
+
+    Returns:
+    - export_path: Path to the exported CSV file
+
+    Outputs:
+    - CSV file with regression-ready data
+    - Metadata text file with configuration and starter R code
+    """
+    print("\n" + "="*80)
+    print("EXPORTING DATA FOR R ANALYSIS (BAI-PERRON STRUCTURAL BREAKS)")
+    print("="*80)
+
+    # Determine which variables to export based on transformation flags
+    if use_log_transform and use_deseasonalized:
+        print("Exporting: Logged and Deseasonalized variables")
+
+        # Create export dataframe with regression-ready variables
+        export_data = pd.DataFrame({
+            'Datetime': data.index,
+            'Price': data['Price_Log_Deseasonalized'],
+            'Wind_Forecast': data['Wind_Forecast_Log'],  # NOT deseasonalized per Fredriksson
+            'Hydro_Reserves': data['Hydro_Reserves_Log_Deseasonalized'],
+            'Net_Exchange': data['Net_Exchange'],  # NOT logged or deseasonalized
+            'Consumption': data['Consumption_Log_Deseasonalized'],
+            'Oil_Price': data['Oil_Price_Log_Deseasonalized'],
+            'Gas_Price': data['Gas_Price_Log_Deseasonalized']
+        })
+
+        # Add bottleneck dummies if present
+        trading_partners = TRADING_PARTNERS.get(zone, [])
+        for partner in trading_partners:
+            bneck_col = f'BNECK_{zone}_{partner}'
+            if bneck_col in data.columns:
+                export_data[bneck_col] = data[bneck_col]
+                print(f"  Added bottleneck dummy: {bneck_col}")
+
+    elif use_log_transform:
+        print("Exporting: Logged variables (not deseasonalized)")
+
+        export_data = pd.DataFrame({
+            'Datetime': data.index,
+            'Price': data['Price_Log'],
+            'Wind_Forecast': data['Wind_Forecast_Log'],
+            'Hydro_Reserves': data['Hydro_Reserves_Log'],
+            'Net_Exchange': data['Net_Exchange'],
+            'Consumption': data['Consumption_Log'],
+            'Oil_Price': data['Oil_Price_Log'],
+            'Gas_Price': data['Gas_Price_Log']
+        })
+
+        # Add bottleneck dummies
+        trading_partners = TRADING_PARTNERS.get(zone, [])
+        for partner in trading_partners:
+            bneck_col = f'BNECK_{zone}_{partner}'
+            if bneck_col in data.columns:
+                export_data[bneck_col] = data[bneck_col]
+
+    else:
+        print("Exporting: Raw variables (no transformations)")
+
+        export_data = pd.DataFrame({
+            'Datetime': data.index,
+            'Price': data['Price'],
+            'Wind_Forecast': data['Wind_Forecast'],
+            'Hydro_Reserves': data['Hydro_Reserves'],
+            'Net_Exchange': data['Net_Exchange'],
+            'Consumption': data['Consumption'],
+            'Oil_Price': data['Oil_Price'],
+            'Gas_Price': data['Gas_Price']
+        })
+
+        # Add bottleneck dummies
+        trading_partners = TRADING_PARTNERS.get(zone, [])
+        for partner in trading_partners:
+            bneck_col = f'BNECK_{zone}_{partner}'
+            if bneck_col in data.columns:
+                export_data[bneck_col] = data[bneck_col]
+
+    # Remove any remaining NaN values
+    rows_before = len(export_data)
+    export_data = export_data.dropna()
+    rows_after = len(export_data)
+
+    if rows_before > rows_after:
+        print(f"\nDropped {rows_before - rows_after} rows with missing values")
+
+    # Create export directory if needed
+    os.makedirs(export_dir, exist_ok=True)
+
+    # Save to CSV
+    export_path = os.path.join(export_dir, f'regression_data_{zone}_for_R.csv')
+    export_data.to_csv(export_path, index=False)
+
+    print(f"\n[OK] Exported {len(export_data):,} observations")
+    print(f"[OK] Variables: {list(export_data.columns)}")
+    print(f"[OK] Date range: {export_data['Datetime'].min()} to {export_data['Datetime'].max()}")
+    print(f"[OK] Saved to: {export_path}")
+
+    # Also save a metadata file with configuration info
+    metadata_path = os.path.join(export_dir, f'metadata_{zone}.txt')
+    with open(metadata_path, 'w') as f:
+        f.write("="*80 + "\n")
+        f.write(f"DATA EXPORT FOR R ANALYSIS - {zone}\n")
+        f.write("="*80 + "\n\n")
+
+        f.write("Configuration:\n")
+        f.write(f"  Zone: {zone}\n")
+        f.write(f"  Log transform: {use_log_transform}\n")
+        f.write(f"  Deseasonalized: {use_deseasonalized}\n")
+        f.write(f"  Outlier handling: {handle_outliers} ({outlier_method})\n")
+        f.write(f"  Negative price handling: {negative_price_handling}\n")
+        f.write(f"  Interpolation: {use_interpolation}\n\n")
+
+        f.write("Regression specification for R:\n")
+        f.write("  Dependent variable: Price\n")
+        f.write("  Independent variables:\n")
+        for col in export_data.columns:
+            if col != 'Datetime' and col != 'Price':
+                f.write(f"    - {col}\n")
+
+        f.write(f"\nData characteristics:\n")
+        f.write(f"  Observations: {len(export_data):,}\n")
+        f.write(f"  Start date: {export_data['Datetime'].min()}\n")
+        f.write(f"  End date: {export_data['Datetime'].max()}\n")
+        f.write(f"  Frequency: Hourly\n\n")
+
+        f.write("Suggested R code:\n")
+        f.write("  library(strucchange)\n")
+        f.write(f"  data <- read.csv('data_for_R/regression_data_{zone}_for_R.csv')\n")
+        f.write("  data$Datetime <- as.POSIXct(data$Datetime)\n")
+        f.write("  \n")
+        f.write("  # Bai-Perron test\n")
+        f.write("  formula <- Price ~ Wind_Forecast + Hydro_Reserves + Net_Exchange + \n")
+        f.write("                     Consumption + Oil_Price + Gas_Price")
+
+        # Add bottleneck dummies to formula if present
+        if any(col.startswith('BNECK_') for col in export_data.columns):
+            f.write(" + \n")
+            bneck_cols = [col for col in export_data.columns if col.startswith('BNECK_')]
+            f.write("                     " + " + ".join(bneck_cols))
+
+        f.write("\n  bp <- breakpoints(formula, data=data, h=0.15)\n")
+        f.write("  summary(bp)\n")
+        f.write("  plot(bp)\n")
+
+    print(f"[OK] Saved metadata to: {metadata_path}")
+    print("="*80 + "\n")
+
+    return export_path
+
+
 # --- 6. EXECUTION BLOCK ---
 
 if __name__ == "__main__":
@@ -2808,38 +3967,25 @@ if __name__ == "__main__":
     # Toggle for data visualization and outlier detection
     # When True: generates comprehensive visualizations of raw data and outlier detection
     # When False: skips visualization and proceeds directly to regression analysis
-    RUN_VISUALIZATIONS = True
+    RUN_VISUALIZATIONS = False
 
-    # --- TRANSFORMATION TOGGLES (STANDARD APPROACH) ---
-    # Toggle for logarithmic transformation (Fredriksson 2016 methodology)
-    # When True: applies log() to Price, Wind_Forecast, Hydro_Reserves, Consumption, Oil_Price, Gas_Price
-    # Net_Exchange is NOT logged (can contain negative values)
-    # STANDARD APPROACH: Log transformation is applied FIRST, before deseasonalization
-    USE_LOG_TRANSFORM = True
-
-    # Toggle for deseasonalization (Fredriksson 2016 methodology)
-    # When True: deseasonalizes the LOGGED variables using dummy variable regression
-    # STANDARD APPROACH: Deseasonalization is applied to LOGGED series (after log transformation)
-    USE_DESEASONALIZED = True
+    # --- TRANSFORMATION SETTINGS (ALWAYS APPLIED) ---
+    # Log transformation and deseasonalization are ALWAYS applied (Fredriksson 2016 methodology)
+    # - Log: applies log() to Price, Wind_Forecast, Hydro_Reserves, Consumption, Oil_Price, Gas_Price
+    # - Net_Exchange is NOT logged (can contain negative values)
+    # - Deseasonalization: applied to LOGGED series using dummy variable regression
+    # These transformations are hardcoded and cannot be toggled off.
 
     # --- NEGATIVE VALUE HANDLING ---
     # Method for handling negative price values (before log transformation)
     # 'clip': Replace values below 0.01 with 0.01 (current default, affects only negative/zero values)
     # 'shift': Shift entire price series upward so minimum becomes 0.01 (preserves relative differences)
     # Note: Net_Exchange is never modified (expected to have negative values)
-    NEGATIVE_PRICE_HANDLING = 'clip'  # Options: 'clip' or 'shift'
+    NEGATIVE_PRICE_HANDLING = 'shift'  # Options: 'clip' or 'shift'
 
-    # --- PROGRESS TRACKING TOGGLE ---
-    # When True: displays progress bars for long-running operations (requires tqdm for best experience)
-    # When False: minimal output (current behavior)
-    SHOW_PROGRESS_BARS = False
-
-    # --- OUTLIER HANDLING TOGGLES ---
-    # Toggle for outlier replacement
-    # When True: replaces outliers using selected method
-    # When False: keeps outliers in the data (no replacement)
-    HANDLE_OUTLIERS = True
-
+    # --- OUTLIER HANDLING SETTINGS ---
+    # Outlier handling is ALWAYS applied (cannot be toggled off)
+    #
     # Outlier handling method selection
     # 'fredriksson': Fredriksson (2016) methodology
     #   - Threshold: +6σ / -3.7σ (asymmetric)
@@ -2854,7 +4000,7 @@ if __name__ == "__main__":
     #   1st: On original price series (found 31 outliers)
     #   2nd: On deseasonalized price series (found 42 outliers)
     #
-    # OUR APPROACH: Apply outlier filter ONCE, on logged-deseasonalized series
+    # OUR DEFAULT APPROACH: Apply outlier filter ONCE, on logged-deseasonalized series
     # Rationale:
     #   - Seasonal patterns mask true outliers (e.g., high winter prices vs low summer)
     #   - Log transformation stabilizes variance
@@ -2862,12 +4008,33 @@ if __name__ == "__main__":
     #   - Cleaner single-pass approach with stronger statistical justification
     #   - Fredriksson provides no theoretical justification for double application
     #
+    # ALTERNATIVE APPROACH (via HANDLE_OUTLIERS_BEFORE_LOG=True):
+    #   Apply outlier filter on raw price series before log transformation
+    #   - Suitable when outliers are data quality issues rather than market events
+    #   - Prevents near-zero prices from creating excessive negative outliers in log space
+    #
     # TODO: Future sensitivity analysis could compare single vs. double application
 
     # Toggle for linear interpolation of missing values
     # When True: fills missing values by linear interpolation between surrounding values
     # When False: drops all rows with missing values (original behavior)
     USE_LINEAR_INTERPOLATION = True
+
+    # --- OUTLIER TIMING CONFIGURATION ---
+    # Control WHEN outlier handling is applied in the transformation pipeline
+    #
+    # When True: Apply outlier detection/replacement BEFORE log transformation
+    #   - Applied to raw Price series (after negative value handling)
+    #   - Statistical rationale: Remove extreme values that could distort log transformation
+    #   - Suitable when outliers are data quality issues (recording errors, system failures)
+    #
+    # When False: Apply outlier detection/replacement AFTER log + deseasonalization (DEFAULT)
+    #   - Applied to logged-deseasonalized Price series (current behavior)
+    #   - Statistical rationale: Remove outliers in transformed space with stabilized variance
+    #   - Suitable when outliers are legitimate extreme market events
+    #
+    # Note: Cannot apply BOTH early and late outlier handling in single run
+    HANDLE_OUTLIERS_BEFORE_LOG = False  # Default: False (preserves current behavior)
 
     # --- COMMODITY PRICE LAGGING ---
     # Commodity prices (oil & gas) are ALWAYS lagged by 24 hours (hardcoded in pipeline)
@@ -2878,16 +4045,16 @@ if __name__ == "__main__":
     # --- DIAGNOSTIC TEST TOGGLES (Fredriksson 2016 methodology) ---
     # Toggle for Ljung-Box test for autocorrelation
     # Tests whether residuals exhibit autocorrelation at various lag lengths
-    RUN_LJUNGBOX_TEST = True
+    RUN_LJUNGBOX_TEST = False
 
     # Toggle for heteroskedasticity and ARCH effects tests
     # Includes Engle's ARCH test and Ljung-Box Q test on squared residuals
     # If ARCH effects detected, consider implementing GARCHX model
-    RUN_HETEROSKEDASTICITY_TESTS = True
+    RUN_HETEROSKEDASTICITY_TESTS = False
 
     # Toggle for stationarity tests (ADF and DF-GLS)
     # Tests whether price series has a unit root (non-stationary)
-    RUN_STATIONARITY_TESTS = True
+    RUN_STATIONARITY_TESTS = False
 
     # --- MODEL SPECIFICATION TOGGLES ---
     # Toggle for automated ARMAX lag selection via AIC minimization
@@ -2917,23 +4084,53 @@ if __name__ == "__main__":
     # --- ROLLING-WINDOW ESTIMATION TOGGLE ---
     # When True: estimates wind coefficient using overlapping rolling windows (skips OLS/ARMAX)
     # When False: runs standard full-sample analysis
-    RUN_ROLLING_WINDOW = True
+    RUN_ROLLING_WINDOW = False
 
     # Rolling window configuration
-    ROLLING_WINDOW_YEARS = 3          # Window size in years
-    ROLLING_STEP_YEARS = 1            # Step size between windows in years
-    ROLLING_MIN_OBS = 24 * 365 * 3 - 24 * 30        # ~3 years minus 1 month tolerance
+    ROLLING_WINDOW_YEARS = 1          # Window size in years
+    ROLLING_STEP_YEARS = 1/12            # Step size between windows in years
+    ROLLING_MIN_OBS = 24 * 365 - 24 * 30        # ~3 years minus 1 month tolerance, 24 * 365 * 3 - 24 * 30
 
     # --- QUANTILE REGRESSION TOGGLE ---
     # When True: estimates wind coefficient across quantiles of price distribution (skips OLS/ARMAX)
     # When False: runs standard analysis
     RUN_QUANTILE_REGRESSION = False
 
+    # --- STRUCTURAL BREAK ANALYSIS TOGGLE ---
+    # When True: detects structural breaks in wind coefficient
+    # When False: runs standard analysis
+    # NOTE: Requires 'ruptures' package for level break analysis (pip install ruptures)
+    RUN_STRUCTURAL_BREAK = True
+
+    # Structural break TYPE:
+    # 'level' - Tests for step changes in coefficient mean (Bai-Perron methodology)
+    # 'trend' - Tests for changes in coefficient slope over time (segmented linear regression)
+    STRUCTURAL_BREAK_TYPE = 'trend'  # 'level' or 'trend'
+
+    # Structural break configuration
+    STRUCTURAL_BREAK_MAX_BREAKS = 1           # Maximum number of breaks to test (for both 'level' and 'trend')
+    STRUCTURAL_BREAK_TRIMMING = 0.1          # Fraction of data to trim from endpoints (0.15 = 15%)
+    # Known event dates to test with Chow test (list of 'YYYY-MM-DD' strings) - only for 'level' type
+    # Examples: Russia-Ukraine invasion, COVID lockdowns, policy changes
+    STRUCTURAL_BREAK_KNOWN_DATES = None #['2022-02-24', '2020-03-11'] # Russia invades Ukraine, # WHO declares COVID-19 pandemic
+
+    # Structural break rolling window configuration (independent from standalone rolling window)
+    STRUCTURAL_BREAK_WINDOW_YEARS = 1       # Window size in years for coefficient estimation
+    STRUCTURAL_BREAK_STEP_YEARS = 1/12      # Step size between windows in years
+    STRUCTURAL_BREAK_MIN_OBS = 24 * 365 - 24 * 30  # Minimum observations per window
+
+    # --- R DATA EXPORT TOGGLE ---
+    # When True: exports fully processed data to CSV for R's strucchange package (Bai-Perron)
+    # When False: skips data export
+    # Output: data_for_R/regression_data_{zone}_for_R.csv + metadata file
+    EXPORT_DATA_FOR_R = False
+
     # Data file paths - dynamically set based on ACTIVE_ZONE
     PATHS = {
         'combined': f'master data files/2015-2025/Combined_{ACTIVE_ZONE}_Data_2015_2025.xlsx',
         'hydro': 'master data files/Master_Hydro_Reservoir.xlsx',
-        'commodities': 'master data files/Master_Commodities.xlsx'
+        'crude_oil': 'master data files/2015-2025/Light_Crude_Oil_2015_2025.xlsx',
+        'commodities': 'master data files/Master_Commodities.xlsx'  # Still used for TTF Gas
     }
 
     try:
@@ -2962,58 +4159,102 @@ if __name__ == "__main__":
         # NOTE: This happens AFTER raw visualization so we can see the original data quality issues
         data = handle_negative_prices(data, method=NEGATIVE_PRICE_HANDLING)
 
-        # --- STEP 3: LOG TRANSFORMATION (if enabled) ---
+        # --- STEP 2.5: EARLY OUTLIER HANDLING (if configured) ---
+        # Applies if HANDLE_OUTLIERS_BEFORE_LOG=True
+        #
+        # EARLY OUTLIER DETECTION RATIONALE:
+        #   - Applied to RAW price series (after negative value handling)
+        #   - Suitable when outliers are data quality issues (recording errors, sensor failures)
+        #   - Prevents extreme values from distorting log transformation
+        #   - Trade-off: Less statistically rigorous (non-stabilized variance, seasonal patterns present)
+        if HANDLE_OUTLIERS_BEFORE_LOG:
+            print("\n" + "="*80)
+            print("STEP 2.5: EARLY OUTLIER HANDLING (BEFORE LOG TRANSFORMATION)")
+            print("="*80)
+            print("Applying outlier detection and replacement to raw Price series")
+            print("This occurs AFTER negative value handling but BEFORE log transformation\n")
+
+            if OUTLIER_METHOD == 'fredriksson':
+                data, outlier_stats_early = handle_outliers_fredriksson(data, apply_to_raw=True)
+            elif OUTLIER_METHOD == 'gianfreda':
+                data, outlier_stats_early = handle_outliers_gianfreda(data, apply_to_raw=True)
+            else:
+                raise ValueError(f"Unknown outlier method: {OUTLIER_METHOD}. Choose 'fredriksson' or 'gianfreda'.")
+
+        # --- STEP 3: LOG TRANSFORMATION (always applied) ---
         # STANDARD APPROACH: Apply log transformation FIRST, before deseasonalization
         # This is the standard econometric approach for handling multiplicative seasonality
         # Note: Commodity prices are already lagged at this point
         # Note: Price negative values handled in STEP 2 (before log transformation)
-        if USE_LOG_TRANSFORM:
-            data = apply_log_transform(data)
+        data = apply_log_transform(data)
 
-            # Visualize logged data (if enabled)
-            # This shows data AFTER negative handling and log transformation
-            if RUN_VISUALIZATIONS:
-                # Create temporary dataframe with logged variables mapped to base names for visualization
-                data_logged_viz = data.copy()
-                data_logged_viz['Price'] = data_logged_viz['Price_Log']
-                data_logged_viz['Wind_Forecast'] = data_logged_viz['Wind_Forecast_Log']
-                data_logged_viz['Hydro_Reserves'] = data_logged_viz['Hydro_Reserves_Log']
-                data_logged_viz['Consumption'] = data_logged_viz['Consumption_Log']
-                # Net_Exchange stays the same (not logged)
-                run_visualizations(data_logged_viz, ACTIVE_ZONE, method=OUTLIER_METHOD, stage='logged')
+        # Visualize logged data (if enabled)
+        # This shows data AFTER negative handling and log transformation
+        if RUN_VISUALIZATIONS:
+            # Create temporary dataframe with logged variables mapped to base names for visualization
+            data_logged_viz = data.copy()
+            data_logged_viz['Price'] = data_logged_viz['Price_Log']
+            data_logged_viz['Wind_Forecast'] = data_logged_viz['Wind_Forecast_Log']
+            data_logged_viz['Hydro_Reserves'] = data_logged_viz['Hydro_Reserves_Log']
+            data_logged_viz['Consumption'] = data_logged_viz['Consumption_Log']
+            data_logged_viz['Oil_Price'] = data_logged_viz['Oil_Price_Log']
+            # Net_Exchange stays the same (not logged)
+            run_visualizations(data_logged_viz, ACTIVE_ZONE, method=OUTLIER_METHOD, stage='logged')
 
-        # --- STEP 4: DESEASONALIZATION (if enabled) ---
+        # --- STEP 4: DESEASONALIZATION (always applied) ---
         # STANDARD APPROACH: Deseasonalize the LOGGED variables (after log transformation)
         # Price & Consumption: Year + Month + DOW + Hour + Holiday (FULL deseasonalization)
         # Hydro, Oil, Gas: Year + Month ONLY (PARTIAL - no intraday patterns)
-        if USE_DESEASONALIZED:
-            data = deseasonalize_logged_variables(data)
+        data = deseasonalize_logged_variables(data)
 
-        # --- STEP 5: OUTLIER HANDLING (if enabled) ---
-        # Apply outlier handling to logged-deseasonalized series (if both transformations enabled)
-        # This provides the most meaningful outlier detection:
-        #   - Log transformation stabilizes variance
-        #   - Deseasonalization removes seasonal patterns
-        #   - Threshold more meaningful on transformed data
-        if HANDLE_OUTLIERS:
+        # --- STEP 5: LATE OUTLIER HANDLING (if not applied early) ---
+        # Applies if HANDLE_OUTLIERS_BEFORE_LOG=False
+        #
+        # LATE OUTLIER DETECTION RATIONALE (RECOMMENDED APPROACH):
+        #   - Applied to LOGGED-DESEASONALIZED series
+        #   - More statistically rigorous:
+        #       * Log transformation stabilizes variance
+        #       * Deseasonalization removes seasonal patterns (high winter vs low summer)
+        #       * Threshold more meaningful on zero-centered deseasonalized data
+        #   - Suitable when outliers are extreme market events (not recording errors)
+        #
+        # MUTUALLY EXCLUSIVE WITH STEP 2.5:
+        #   - Cannot apply both early and late outlier handling in same run
+        #   - Prevents double-replacement of outliers
+        if not HANDLE_OUTLIERS_BEFORE_LOG:
+            print("\n" + "="*80)
+            print("STEP 5: LATE OUTLIER HANDLING (AFTER TRANSFORMATIONS)")
+            print("="*80)
+            print("Applying outlier detection and replacement to transformed Price series")
+            print("This occurs AFTER log transformation and deseasonalization\n")
+
             if OUTLIER_METHOD == 'fredriksson':
-                data, outlier_stats = handle_outliers_fredriksson(data,
-                                                                  use_log_transform=USE_LOG_TRANSFORM,
-                                                                  use_deseasonalized=USE_DESEASONALIZED)
+                data, outlier_stats = handle_outliers_fredriksson(data, apply_to_raw=False)
             elif OUTLIER_METHOD == 'gianfreda':
-                data, outlier_stats = handle_outliers_gianfreda(data,
-                                                                use_log_transform=USE_LOG_TRANSFORM,
-                                                                use_deseasonalized=USE_DESEASONALIZED)
+                data, outlier_stats = handle_outliers_gianfreda(data, apply_to_raw=False)
             else:
                 raise ValueError(f"Unknown outlier method: {OUTLIER_METHOD}. Choose 'fredriksson' or 'gianfreda'.")
+
+        # --- EXPORT DATA FOR R ANALYSIS (BAI-PERRON) ---
+        # Export fully processed data for structural break testing in R
+        # Note: Always exports logged and deseasonalized data (standard pipeline)
+        if EXPORT_DATA_FOR_R:
+            export_data_for_R(
+                data=data,
+                zone=ACTIVE_ZONE,
+                use_log_transform=True,  # Always applied in standard pipeline
+                use_deseasonalized=True,  # Always applied in standard pipeline
+                handle_outliers=True,     # Always applied in standard pipeline
+                outlier_method=OUTLIER_METHOD,
+                negative_price_handling=NEGATIVE_PRICE_HANDLING,
+                use_interpolation=USE_LINEAR_INTERPOLATION
+            )
 
         # --- STEP 6: REGRESSION ANALYSIS ---
         # Run regression models with optional diagnostic tests
         # Commodity prices used in regression are lagged by 24h (from load_data)
         ols_model, armax_res, garch_res = perform_multivariate_analysis(data, ACTIVE_ZONE,
                                       target_region=ACTIVE_ZONE,
-                                      use_log_transform=USE_LOG_TRANSFORM,
-                                      use_deseasonalized=USE_DESEASONALIZED,
                                       run_ljungbox=RUN_LJUNGBOX_TEST,
                                       run_hetero_tests=RUN_HETEROSKEDASTICITY_TESTS,
                                       run_stationarity=RUN_STATIONARITY_TESTS,
@@ -3025,7 +4266,14 @@ if __name__ == "__main__":
                                       rolling_step_years=ROLLING_STEP_YEARS,
                                       rolling_min_obs=ROLLING_MIN_OBS,
                                       run_quantile_regression=RUN_QUANTILE_REGRESSION,
-                                      show_progress=SHOW_PROGRESS_BARS)
+                                      run_structural_break=RUN_STRUCTURAL_BREAK,
+                                      structural_break_type=STRUCTURAL_BREAK_TYPE,
+                                      structural_break_max_breaks=STRUCTURAL_BREAK_MAX_BREAKS,
+                                      structural_break_trimming=STRUCTURAL_BREAK_TRIMMING,
+                                      structural_break_known_dates=STRUCTURAL_BREAK_KNOWN_DATES,
+                                      structural_break_window_years=STRUCTURAL_BREAK_WINDOW_YEARS,
+                                      structural_break_step_years=STRUCTURAL_BREAK_STEP_YEARS,
+                                      structural_break_min_obs=STRUCTURAL_BREAK_MIN_OBS)
 
     except Exception as e:
         print(f"Critical error during execution: {e}")

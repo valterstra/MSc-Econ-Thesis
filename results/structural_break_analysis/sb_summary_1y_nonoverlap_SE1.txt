@@ -1,0 +1,36 @@
+================================================================================
+STRUCTURAL BREAK ANALYSIS SUMMARY - SE1
+================================================================================
+
+Configuration:
+  Config label: 1y_nonoverlap
+  Rolling window: 8760 hours (365.0 days)
+  Step size: 8760 hours (365.0 days)
+  Window type: Non-overlapping
+
+Data range: 2015-01-01 00:00:00 to 2025-12-31 00:00:00
+Total observations: 96,475
+
+--------------------------------------------------------------------------------
+BAI-PERRON BREAK DETECTION
+--------------------------------------------------------------------------------
+Optimal number of breaks (BIC): 1
+Detected break dates:
+  - 2020-06-29
+
+--------------------------------------------------------------------------------
+CHOW TEST RESULTS
+--------------------------------------------------------------------------------
+
+Break date: 2020-06-29 (Bai-Perron detected)
+  Pre-break beta_wind:  -0.0593 (SE=0.0018)
+  Post-break beta_wind: -0.5282 (SE=0.0061)
+  Change: -0.4689 (-791.4%)
+  F-statistic: 2184.34, p-value: 0.0000e+00
+  Significant at 5%: YES
+
+--------------------------------------------------------------------------------
+CUSUM TEST
+--------------------------------------------------------------------------------
+Boundary violations: 0
+No violations (parameters appear stable)

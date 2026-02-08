@@ -1,0 +1,38 @@
+================================================================================
+SEQUENTIAL TREND BREAK ANALYSIS SUMMARY - SE2
+================================================================================
+
+Configuration:
+  Config label: 1y_window_1m_step_trend
+  Rolling window: 1 year(s)
+  Step size: 1 month(s)
+  Minimum observations per window: 8,040
+  Maximum breaks tested: 2
+
+Data: 121 rolling windows
+
+--------------------------------------------------------------------------------
+MODEL COMPARISON (BIC)
+--------------------------------------------------------------------------------
+  0 breaks: BIC = -740.04
+  1 breaks: BIC = -864.85
+  2 breaks: BIC = -971.58 <-- SELECTED
+
+--------------------------------------------------------------------------------
+SEQUENTIAL F-TESTS
+--------------------------------------------------------------------------------
+  0 vs 1 breaks: F = 119.15, p = 0.0000e+00
+    Significant at 5%: YES
+  1 vs 2 breaks: F = 92.87, p = 0.0000e+00
+    Significant at 5%: YES
+
+--------------------------------------------------------------------------------
+SELECTED MODEL
+--------------------------------------------------------------------------------
+Number of breaks: 2
+Break dates: ['2021-03-01', '2022-12-01']
+
+Segment details:
+  Segment 1: slope = -0.000297 (SE: 0.000037)
+  Segment 2: slope = -0.012561 (SE: 0.000847)
+  Segment 3: slope = -0.000286 (SE: 0.000472)

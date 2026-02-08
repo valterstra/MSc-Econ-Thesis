@@ -1,0 +1,52 @@
+================================================================================
+STRUCTURAL BREAK ANALYSIS SUMMARY - SE1
+================================================================================
+
+Configuration:
+  Config label: 3m_nonoverlap
+  Rolling window: 2160 hours (90.0 days)
+  Step size: 2160 hours (90.0 days)
+  Window type: Non-overlapping
+
+Data range: 2015-01-01 00:00:00 to 2025-12-31 00:00:00
+Total observations: 96,475
+
+--------------------------------------------------------------------------------
+BAI-PERRON BREAK DETECTION
+--------------------------------------------------------------------------------
+Optimal number of breaks (BIC): 3
+Detected break dates:
+  - 2020-01-18
+  - 2022-07-06
+  - 2023-09-29
+
+--------------------------------------------------------------------------------
+CHOW TEST RESULTS
+--------------------------------------------------------------------------------
+
+Break date: 2020-01-18 (Bai-Perron detected)
+  Pre-break beta_wind:  -0.0482 (SE=0.0018)
+  Post-break beta_wind: -0.5014 (SE=0.0058)
+  Change: -0.4532 (-940.3%)
+  F-statistic: 1945.08, p-value: 0.0000e+00
+  Significant at 5%: YES
+
+Break date: 2022-07-06 (Bai-Perron detected)
+  Pre-break beta_wind:  -0.0914 (SE=0.0019)
+  Post-break beta_wind: -0.6632 (SE=0.0085)
+  Change: -0.5718 (-625.6%)
+  F-statistic: 3034.62, p-value: 0.0000e+00
+  Significant at 5%: YES
+
+Break date: 2023-09-29 (Bai-Perron detected)
+  Pre-break beta_wind:  -0.1339 (SE=0.0025)
+  Post-break beta_wind: -0.6592 (SE=0.0106)
+  Change: -0.5253 (-392.4%)
+  F-statistic: 2624.95, p-value: 0.0000e+00
+  Significant at 5%: YES
+
+--------------------------------------------------------------------------------
+CUSUM TEST
+--------------------------------------------------------------------------------
+Boundary violations: 0
+No violations (parameters appear stable)
