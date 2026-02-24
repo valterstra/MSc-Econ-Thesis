@@ -1589,7 +1589,7 @@ def _extract_armax_wind_coef(armax_model, wind_col):
     )
 
 
-def _extract_armax_exog_anchor(armax_model, exog_names):
+def _extract_armax_exog_anchor(armax_model, exog_names, scale_means=None, scale_stds=None):
     """
     Extract exogenous coefficient anchor vector (const + exog terms) from ARMAX results.
     Excludes AR/MA/sigma parameters by explicit term selection.
@@ -1607,6 +1607,21 @@ def _extract_armax_exog_anchor(armax_model, exog_names):
         )
 
     anchor = {term: float(param_map[term]) for term in target_terms}
+
+    # If model was fit with scaled exogenous variables, convert coefficients back to raw units.
+    if scale_means is not None and scale_stds is not None:
+        scale_means = pd.Series(scale_means)
+        scale_stds = pd.Series(scale_stds).replace(0, 1.0).fillna(1.0)
+        for col in exog_names:
+            if col in anchor and col in scale_stds.index:
+                anchor[col] = float(anchor[col]) / float(scale_stds[col])
+        if 'const' in anchor:
+            const_raw = float(anchor['const'])
+            for col in exog_names:
+                if col in anchor and col in scale_means.index:
+                    const_raw -= float(anchor[col]) * float(scale_means[col])
+            anchor['const'] = const_raw
+
     return anchor
 
 
@@ -1691,6 +1706,48 @@ def _transform_anchor_raw_to_scaled(exog_anchor_map, means, stds):
         out['const'] = const_scaled
 
     return out
+
+
+def _build_exog_backtransform_table(armax_model, exog_names, scale_means=None, scale_stds=None):
+    """
+    Build a comparison table for scaled vs raw exogenous coefficients.
+    If scale stats are not provided, raw columns equal scaled columns.
+    """
+    param_names = list(armax_model.param_names)
+    params = np.asarray(armax_model.params)
+    bse = np.asarray(armax_model.bse)
+    pvalues = np.asarray(armax_model.pvalues)
+
+    means = pd.Series(scale_means) if scale_means is not None else pd.Series(dtype=float)
+    stds = pd.Series(scale_stds) if scale_stds is not None else pd.Series(dtype=float)
+    stds = stds.replace(0, 1.0).fillna(1.0)
+
+    rows = []
+    for term in exog_names:
+        if term not in param_names:
+            continue
+        idx = param_names.index(term)
+        coef_scaled = float(params[idx])
+        se_scaled = float(bse[idx])
+        pval = float(pvalues[idx])
+
+        if term in stds.index:
+            coef_raw = coef_scaled / float(stds[term])
+            se_raw = se_scaled / float(stds[term])
+        else:
+            coef_raw = coef_scaled
+            se_raw = se_scaled
+
+        rows.append({
+            'term': term,
+            'coef_scaled': coef_scaled,
+            'se_scaled': se_scaled,
+            'coef_raw': coef_raw,
+            'se_raw': se_raw,
+            'p_value': pval
+        })
+
+    return pd.DataFrame(rows)
 
 
 def _attach_inferred_frequency(y, X_exog):
@@ -1860,6 +1917,8 @@ def _fit_armax_with_controls(y, X_exog, order=(3, 0, 3), context_label="",
         anchor_local = exog_anchor_map
         if scale_exog:
             x_fit_local, means, stds = _zscore_exog(x_fit)
+            diagnostics['scale_means'] = {k: float(v) for k, v in means.items()}
+            diagnostics['scale_stds'] = {k: float(v) for k, v in stds.items()}
             if exog_anchor_map:
                 anchor_local = _transform_anchor_raw_to_scaled(exog_anchor_map, means, stds)
 
@@ -4369,6 +4428,12 @@ def _evaluate_armax_candidate(Y, exog_vars, p, q,
         result['diagnosis_why'] = 'Converged successfully.'
         try:
             beta_wind, se_wind, p_wind = _extract_armax_wind_coef(model, 'Wind_Forecast_Log')
+            if bool(diag.get('exog_scaled', False)):
+                stds = pd.Series(diag.get('scale_stds', {}))
+                wind_std = float(stds.get('Wind_Forecast_Log', 1.0))
+                if wind_std != 0:
+                    beta_wind = float(beta_wind) / wind_std
+                    se_wind = float(se_wind) / wind_std
             result['beta_wind'] = float(beta_wind)
             result['wind_se'] = float(se_wind)
             result['wind_stars'] = _sig_stars(p_wind)
@@ -5151,11 +5216,35 @@ def perform_multivariate_analysis(df, zone, target_region='SE1',
 
     print(f"\nMEAN EQUATION (Price Level) - ARMAX{selected_order}:")
     print(armax_res.summary())
+    if bool(diag.get('exog_scaled', False)):
+        try:
+            back_df = _build_exog_backtransform_table(
+                armax_model=armax_res,
+                exog_names=exog_vars,
+                scale_means=diag.get('scale_means', {}),
+                scale_stds=diag.get('scale_stds', {})
+            )
+            if not back_df.empty:
+                print("\n--- EXOGENOUS COEFFICIENTS BACK-TRANSFORMED TO ORIGINAL UNITS ---")
+                print(f"{'Term':<38} {'Raw Coef':>12} {'Raw SE':>12} {'p-value':>12}")
+                print("-" * 78)
+                for _, row in back_df.iterrows():
+                    print(
+                        f"{row['term']:<38} "
+                        f"{row['coef_raw']:>12.6f} {row['se_raw']:>12.6f} {row['p_value']:>12.4g}"
+                    )
+        except Exception as e:
+            print(f"WARNING: Failed to print back-transformed exogenous coefficients: {e}")
 
     if save_armax_exog_anchor:
         if zone == 'SE1' and tuple(selected_order) == (1, 0, 1):
             try:
-                anchor_map = _extract_armax_exog_anchor(armax_res, exog_vars)
+                anchor_map = _extract_armax_exog_anchor(
+                    armax_res,
+                    exog_vars,
+                    scale_means=diag.get('scale_means', {}) if bool(diag.get('exog_scaled', False)) else None,
+                    scale_stds=diag.get('scale_stds', {}) if bool(diag.get('exog_scaled', False)) else None
+                )
                 anchor_path = _save_armax_exog_anchor_csv(
                     anchor_map=anchor_map,
                     zone=zone,
@@ -6094,7 +6183,7 @@ if __name__ == "__main__":
     # Optimizer controls
     ARMAX_MAXITER = 300
     ARMAX_SOLVER = 'statespace'
-    ARMAX_USE_WARM_START = True
+    ARMAX_USE_WARM_START = False
     # Scale exogenous variables to z-scores for ARMAX fitting (improves numerical conditioning)
     ARMAX_SCALE_EXOG = True
     # Fallback ladder if primary order does not converge
@@ -6107,7 +6196,7 @@ if __name__ == "__main__":
     # - extra_ar_lags: sparse lagged dependent terms added to exogenous set for baseline run only
     ARMAX_BASELINE_SPEC = {
         'enabled': True,
-        'order': (1, 0, 1),
+        'order': (3, 0, 3),
         'extra_ar_lags': [],  # Example: [23, 24, 25]
         'drop_initial_nan': True,
         'label': 'ARMAX(3,0,3)'
@@ -6208,7 +6297,7 @@ if __name__ == "__main__":
             zone_hydro=ACTIVE_ZONE,
             use_interpolation=USE_LINEAR_INTERPOLATION,
             start_date='2015-01-01',
-            end_date='2025-12-31',
+            end_date='2026-12-31',
             lag_commodity_hours=LAG_COMMODITY_HOURS
         )
         print(f"Merge successful. Total hourly observations: {len(data)}")
