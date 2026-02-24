@@ -2256,16 +2256,16 @@ if __name__ == "__main__":
     # --- DIAGNOSTIC TEST TOGGLES (Fredriksson 2016 methodology) ---
     # Toggle for Ljung-Box test for autocorrelation
     # Tests whether residuals exhibit autocorrelation at various lag lengths
-    RUN_LJUNGBOX_TEST = False
+    RUN_LJUNGBOX_TEST = True
 
     # Toggle for heteroskedasticity and ARCH effects tests
     # Includes Engle's ARCH test and Ljung-Box Q test on squared residuals
     # If ARCH effects detected, consider implementing GARCHX model
-    RUN_HETEROSKEDASTICITY_TESTS = False
+    RUN_HETEROSKEDASTICITY_TESTS = True
 
     # Toggle for stationarity tests (ADF and DF-GLS)
     # Tests whether price series has a unit root (non-stationary)
-    RUN_STATIONARITY_TESTS = False
+    RUN_STATIONARITY_TESTS = True
 
     # --- MODEL SPECIFICATION TOGGLES ---
     # Toggle for automated ARMAX lag selection via AIC minimization

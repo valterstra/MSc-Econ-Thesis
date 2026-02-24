@@ -1589,6 +1589,78 @@ def _extract_armax_wind_coef(armax_model, wind_col):
     )
 
 
+def _extract_armax_exog_anchor(armax_model, exog_names):
+    """
+    Extract exogenous coefficient anchor vector (const + exog terms) from ARMAX results.
+    Excludes AR/MA/sigma parameters by explicit term selection.
+    """
+    param_names = list(armax_model.param_names)
+    params = np.asarray(armax_model.params)
+    param_map = dict(zip(param_names, params))
+
+    target_terms = ['const'] + list(exog_names)
+    missing = [term for term in target_terms if term not in param_map]
+    if missing:
+        raise ValueError(
+            f"Missing exogenous terms in ARMAX parameter map: {missing}. "
+            f"Available terms: {param_names}"
+        )
+
+    anchor = {term: float(param_map[term]) for term in target_terms}
+    return anchor
+
+
+def _save_armax_exog_anchor_csv(anchor_map, zone, source_order, results_dir='results'):
+    """Save exogenous anchor coefficients as one-row-per-term CSV."""
+    os.makedirs(results_dir, exist_ok=True)
+    p, d, q = source_order
+    timestamp = pd.Timestamp.now().isoformat()
+    rows = []
+    for term, coef in anchor_map.items():
+        rows.append({
+            'zone': zone,
+            'source_order': str(tuple(source_order)),
+            'term': term,
+            'coef': float(coef),
+            'timestamp': timestamp
+        })
+
+    out_df = pd.DataFrame(rows)
+    out_path = os.path.join(results_dir, f'armax_exog_anchor_{zone}_order_{p}_{d}_{q}.csv')
+    out_df.to_csv(out_path, index=False)
+    return out_path
+
+
+def _load_armax_exog_anchor_csv(zone, source_order=(1, 0, 1), results_dir='results'):
+    """
+    Load exogenous anchor coefficients from CSV (one row per term).
+    Returns dict(term -> coef) or None if file is unavailable/invalid.
+    """
+    p, d, q = source_order
+    path = os.path.join(results_dir, f'armax_exog_anchor_{zone}_order_{p}_{d}_{q}.csv')
+    if not os.path.exists(path):
+        return None
+
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return None
+
+    required = {'term', 'coef'}
+    if not required.issubset(df.columns):
+        return None
+
+    anchor_map = {}
+    for _, row in df.iterrows():
+        term = str(row['term'])
+        coef = row['coef']
+        if pd.isna(term) or pd.isna(coef):
+            continue
+        anchor_map[term] = float(coef)
+
+    return anchor_map if anchor_map else None
+
+
 def _attach_inferred_frequency(y, X_exog):
     """
     Attach inferred frequency metadata to datetime index when possible.
@@ -1694,7 +1766,7 @@ def _prepare_baseline_armax_design(y, X_exog, extra_ar_lags=None, drop_initial_n
     return y_aligned, x_aug, added_cols
 
 
-def _build_warm_start_params(y_fit, x_fit, order):
+def _build_warm_start_params(y_fit, x_fit, order, exog_anchor_map=None):
     """
     Build start params by mapping ARMAX(0,0,0)-X estimates into target order params.
     Falls back to statsmodels defaults if mapping fails.
@@ -1719,12 +1791,21 @@ def _build_warm_start_params(y_fit, x_fit, order):
         # Keep default start params if warm-start fitting fails.
         pass
 
+    if exog_anchor_map:
+        try:
+            for i, name in enumerate(param_names):
+                if name in exog_anchor_map:
+                    start_params[i] = float(exog_anchor_map[name])
+        except Exception:
+            # Keep existing starts if anchor mapping fails.
+            pass
+
     return start_params
 
 
 def _fit_armax_with_controls(y, X_exog, order=(3, 0, 3), context_label="",
                              accept_nonconverged=True, maxiter=300, solver='statespace',
-                             use_warm_start=True):
+                             use_warm_start=True, exog_anchor_map=None):
     """
     Fit ARMAX quietly and enforce convergence acceptance.
     Returns dict with keys: ok, model, fail_reason, error, freq, converged, diagnostics.
@@ -1747,7 +1828,9 @@ def _fit_armax_with_controls(y, X_exog, order=(3, 0, 3), context_label="",
             'method_kwargs': {'maxiter': maxiter}
         }
         if use_warm_start:
-            fit_kwargs['start_params'] = _build_warm_start_params(y_fit, x_fit, order)
+            fit_kwargs['start_params'] = _build_warm_start_params(
+                y_fit, x_fit, order, exog_anchor_map=exog_anchor_map
+            )
 
         with warnings.catch_warnings():
             # Keep console noise minimal while still handling failures explicitly.
@@ -4146,10 +4229,24 @@ def _evaluate_armax_candidate(Y, exog_vars, p, q,
                             ljungbox_lags=(5, 10, 15, 20),
                             maxiter=300,
                             solver='statespace',
-                            use_warm_start=True):
+                            use_warm_start=True,
+                            exog_anchor_map=None,
+                            max_p_for_schema=10,
+                            max_q_for_schema=10):
     """Evaluate a single ARMAX(p,0,q) candidate without fallback."""
     order = (p, 0, q)
     timestamp = pd.Timestamp.now().isoformat()
+
+    def _sig_stars(p_value):
+        if p_value is None or pd.isna(p_value):
+            return ""
+        if p_value < 0.01:
+            return "***"
+        if p_value < 0.05:
+            return "**"
+        if p_value < 0.10:
+            return "*"
+        return ""
 
     result = {
         'p': p,
@@ -4163,6 +4260,9 @@ def _evaluate_armax_candidate(Y, exog_vars, p, q,
         'aic': np.nan,
         'bic': np.nan,
         'hqic': np.nan,
+        'beta_wind': np.nan,
+        'wind_se': np.nan,
+        'wind_stars': '',
         'passes_ljungbox': False,
         'diagnosis_label': 'unknown',
         'diagnosis_why': '',
@@ -4174,6 +4274,17 @@ def _evaluate_armax_candidate(Y, exog_vars, p, q,
         result[f'ljungbox_lag_{lag}_stat'] = np.nan
         result[f'ljungbox_lag_{lag}_pval'] = np.nan
 
+    max_p_for_schema = int(max(0, max_p_for_schema))
+    max_q_for_schema = int(max(0, max_q_for_schema))
+    for i in range(1, max_p_for_schema + 1):
+        result[f'ar{i}_coef'] = np.nan
+        result[f'ar{i}_se'] = np.nan
+        result[f'ar{i}_stars'] = ''
+    for i in range(1, max_q_for_schema + 1):
+        result[f'ma{i}_coef'] = np.nan
+        result[f'ma{i}_se'] = np.nan
+        result[f'ma{i}_stars'] = ''
+
     fit = _fit_armax_with_controls(
         y=Y,
         X_exog=exog_vars,
@@ -4182,7 +4293,8 @@ def _evaluate_armax_candidate(Y, exog_vars, p, q,
         accept_nonconverged=True,
         maxiter=maxiter,
         solver=solver,
-        use_warm_start=use_warm_start
+        use_warm_start=use_warm_start,
+        exog_anchor_map=exog_anchor_map
     )
 
     if not fit['ok']:
@@ -4212,6 +4324,44 @@ def _evaluate_armax_candidate(Y, exog_vars, p, q,
     if converged:
         result['diagnosis_label'] = 'converged'
         result['diagnosis_why'] = 'Converged successfully.'
+        try:
+            beta_wind, se_wind, p_wind = _extract_armax_wind_coef(model, 'Wind_Forecast_Log')
+            result['beta_wind'] = float(beta_wind)
+            result['wind_se'] = float(se_wind)
+            result['wind_stars'] = _sig_stars(p_wind)
+        except Exception as e:
+            msg = f"Wind coefficient extraction failed: {e}"
+            if result['error_message']:
+                result['error_message'] += f" | {msg}"
+            else:
+                result['error_message'] = msg
+
+        try:
+            param_names = list(model.param_names)
+            params = np.asarray(model.params)
+            bse = np.asarray(model.bse)
+            pvals = np.asarray(model.pvalues)
+            for idx, name in enumerate(param_names):
+                if name.startswith('ar.L'):
+                    lag_str = name.split('ar.L')[-1]
+                    lag = int(lag_str)
+                    if 1 <= lag <= max_p_for_schema:
+                        result[f'ar{lag}_coef'] = float(params[idx])
+                        result[f'ar{lag}_se'] = float(bse[idx])
+                        result[f'ar{lag}_stars'] = _sig_stars(float(pvals[idx]))
+                elif name.startswith('ma.L'):
+                    lag_str = name.split('ma.L')[-1]
+                    lag = int(lag_str)
+                    if 1 <= lag <= max_q_for_schema:
+                        result[f'ma{lag}_coef'] = float(params[idx])
+                        result[f'ma{lag}_se'] = float(bse[idx])
+                        result[f'ma{lag}_stars'] = _sig_stars(float(pvals[idx]))
+        except Exception as e:
+            msg = f"AR/MA coefficient extraction failed: {e}"
+            if result['error_message']:
+                result['error_message'] += f" | {msg}"
+            else:
+                result['error_message'] = msg
     else:
         label, why = _diagnose_nonconvergence_simple(
             {'ok': True, 'converged': False, 'diagnostics': diag, 'fail_reason': None, 'error': None},
@@ -4342,14 +4492,34 @@ def select_armax_lags_aic(Y, exog_vars, zone='SE1',
                           save_top_n=20,
                           results_dir='results'):
     """Strict ARMAX lag search without fallback; returns best order and full results."""
-    grid = _build_armax_search_grid(p_min, p_max, q_min, q_max, exclude_00=exclude_00)
+    requested_p_min = int(p_min)
+    requested_q_min = int(q_min)
+    p_min_eff = max(1, requested_p_min)
+    q_min_eff = max(1, requested_q_min)
+    p_max_eff = int(p_max)
+    q_max_eff = int(q_max)
+    if p_min_eff != requested_p_min or q_min_eff != requested_q_min:
+        print(f"NOTE: Enforcing ARMAX lag-search floor p>=1, q>=1 (requested p_min={p_min}, q_min={q_min}).")
+    if p_min_eff > p_max_eff or q_min_eff > q_max_eff:
+        raise ValueError(
+            f"Invalid ARMAX grid after enforcing p,q>=1: p={p_min_eff}..{p_max_eff}, q={q_min_eff}..{q_max_eff}."
+        )
+
+    grid = _build_armax_search_grid(p_min_eff, p_max_eff, q_min_eff, q_max_eff, exclude_00=exclude_00)
+    max_p_schema = int(max(0, p_max_eff))
+    max_q_schema = int(max(0, q_max_eff))
+    exog_anchor_map = _load_armax_exog_anchor_csv(zone=zone, source_order=(1, 0, 1), results_dir=results_dir)
 
     print("\n--- ARMAX LAG SELECTION (STRICT GRID SEARCH) ---")
     print(f"Zone: {zone}")
-    print(f"Grid: p={p_min}..{p_max}, q={q_min}..{q_max}, exclude_00={exclude_00}")
+    print(f"Grid: p={p_min_eff}..{p_max_eff}, q={q_min_eff}..{q_max_eff}, exclude_00={exclude_00}")
     print(f"Eligibility: require_convergence={require_convergence}, require_ljungbox_pass={require_ljungbox_pass}")
     print(f"Selection criterion: {selection_criterion.upper()}")
     print(f"Models to test: {len(grid)}")
+    if exog_anchor_map is None:
+        print(f"Anchor starts: no anchor file found for {zone}; using default warm-start logic.")
+    else:
+        print(f"Anchor starts: loaded {len(exog_anchor_map)} terms from armax_exog_anchor_{zone}_order_1_0_1.csv")
 
     rows = []
     total = len(grid)
@@ -4363,7 +4533,10 @@ def select_armax_lags_aic(Y, exog_vars, zone='SE1',
             ljungbox_lags=ljungbox_lags,
             maxiter=maxiter,
             solver=solver,
-            use_warm_start=use_warm_start
+            use_warm_start=use_warm_start,
+            exog_anchor_map=exog_anchor_map,
+            max_p_for_schema=max_p_schema,
+            max_q_for_schema=max_q_schema
         )
         rows.append(row)
         diag_short = row.get('diagnosis_label', '')
@@ -4427,12 +4600,32 @@ def select_armax_lags_aic_checkpointed(Y, exog_vars, zone='SE1',
     if checkpoint_file is None:
         checkpoint_file = os.path.join(results_dir, f'armax_lag_selection_checkpoint_{zone}.csv')
 
-    grid = _build_armax_search_grid(p_min, p_max, q_min, q_max, exclude_00=exclude_00)
+    requested_p_min = int(p_min)
+    requested_q_min = int(q_min)
+    p_min_eff = max(1, requested_p_min)
+    q_min_eff = max(1, requested_q_min)
+    p_max_eff = int(p_max)
+    q_max_eff = int(q_max)
+    if p_min_eff != requested_p_min or q_min_eff != requested_q_min:
+        print(f"NOTE: Enforcing ARMAX lag-search floor p>=1, q>=1 (requested p_min={p_min}, q_min={q_min}).")
+    if p_min_eff > p_max_eff or q_min_eff > q_max_eff:
+        raise ValueError(
+            f"Invalid ARMAX grid after enforcing p,q>=1: p={p_min_eff}..{p_max_eff}, q={q_min_eff}..{q_max_eff}."
+        )
+
+    grid = _build_armax_search_grid(p_min_eff, p_max_eff, q_min_eff, q_max_eff, exclude_00=exclude_00)
+    max_p_schema = int(max(0, p_max_eff))
+    max_q_schema = int(max(0, q_max_eff))
+    exog_anchor_map = _load_armax_exog_anchor_csv(zone=zone, source_order=(1, 0, 1), results_dir=results_dir)
     print("\n--- ARMAX LAG SELECTION (CHECKPOINTED, STRICT) ---")
     print(f"Zone: {zone}")
-    print(f"Grid: p={p_min}..{p_max}, q={q_min}..{q_max}, exclude_00={exclude_00}")
+    print(f"Grid: p={p_min_eff}..{p_max_eff}, q={q_min_eff}..{q_max_eff}, exclude_00={exclude_00}")
     print(f"Selection criterion: {selection_criterion.upper()}")
     print(f"Checkpoint file: {checkpoint_file}")
+    if exog_anchor_map is None:
+        print(f"Anchor starts: no anchor file found for {zone}; using default warm-start logic.")
+    else:
+        print(f"Anchor starts: loaded {len(exog_anchor_map)} terms from armax_exog_anchor_{zone}_order_1_0_1.csv")
 
     if os.path.exists(checkpoint_file):
         checkpoint_df = pd.read_csv(checkpoint_file)
@@ -4467,7 +4660,10 @@ def select_armax_lags_aic_checkpointed(Y, exog_vars, zone='SE1',
             ljungbox_lags=ljungbox_lags,
             maxiter=maxiter,
             solver=solver,
-            use_warm_start=use_warm_start
+            use_warm_start=use_warm_start,
+            exog_anchor_map=exog_anchor_map,
+            max_p_for_schema=max_p_schema,
+            max_q_for_schema=max_q_schema
         )
         print(
             f"status={row['status']} conv={row['converged']} "
@@ -4636,7 +4832,8 @@ def perform_multivariate_analysis(df, zone, target_region='SE1',
                                  bp_random_seed=42,
                                  bp_use_hac_se=True,
                                  structural_break_estimation_model='ols',
-                                 armax_baseline_spec=None):
+                                 armax_baseline_spec=None,
+                                 save_armax_exog_anchor=False):
     """
     Runs OLS, ARMAX, and conditionally GARCH-X with full control variables.
 
@@ -4903,6 +5100,25 @@ def perform_multivariate_analysis(df, zone, target_region='SE1',
 
     print(f"\nMEAN EQUATION (Price Level) - ARMAX{selected_order}:")
     print(armax_res.summary())
+
+    if save_armax_exog_anchor:
+        if zone == 'SE1' and tuple(selected_order) == (1, 0, 1):
+            try:
+                anchor_map = _extract_armax_exog_anchor(armax_res, exog_vars)
+                anchor_path = _save_armax_exog_anchor_csv(
+                    anchor_map=anchor_map,
+                    zone=zone,
+                    source_order=tuple(selected_order),
+                    results_dir='results'
+                )
+                print(f"Saved ARMAX exogenous anchor vector: {anchor_path} ({len(anchor_map)} terms)")
+            except Exception as e:
+                print(f"WARNING: Failed to save ARMAX exogenous anchor vector: {e}")
+        else:
+            print(
+                f"Anchor extraction skipped: requires zone='SE1' and selected_order=(1, 0, 1), "
+                f"got zone='{zone}', selected_order={tuple(selected_order)}."
+            )
 
     # Optional: Diagnostic tests on ARMAX residuals
     arch_detected = False
@@ -5781,16 +5997,16 @@ if __name__ == "__main__":
     # --- DIAGNOSTIC TEST TOGGLES (Fredriksson 2016 methodology) ---
     # Toggle for Ljung-Box test for autocorrelation
     # Tests whether residuals exhibit autocorrelation at various lag lengths
-    RUN_LJUNGBOX_TEST = True
+    RUN_LJUNGBOX_TEST = False
 
     # Toggle for heteroskedasticity and ARCH effects tests
     # Includes Engle's ARCH test and Ljung-Box Q test on squared residuals
     # If ARCH effects detected, consider implementing GARCHX model
-    RUN_HETEROSKEDASTICITY_TESTS = True
+    RUN_HETEROSKEDASTICITY_TESTS = False
 
     # Toggle for stationarity tests (ADF and DF-GLS)
     # Tests whether price series has a unit root (non-stationary)
-    RUN_STATIONARITY_TESTS = True
+    RUN_STATIONARITY_TESTS = False
 
     # --- MODEL SPECIFICATION TOGGLES ---
     # Toggle for automated ARMAX lag selection via AIC minimization
@@ -5807,10 +6023,10 @@ if __name__ == "__main__":
 
     # --- ARMAX SEARCH GRID & SELECTION POLICY ---
     # Search ranges for p and q (inclusive)
-    ARMAX_SEARCH_P_MIN = 1
-    ARMAX_SEARCH_P_MAX = 1
-    ARMAX_SEARCH_Q_MIN = 1
-    ARMAX_SEARCH_Q_MAX = 1
+    ARMAX_SEARCH_P_MIN = 0
+    ARMAX_SEARCH_P_MAX = 3
+    ARMAX_SEARCH_Q_MIN = 0
+    ARMAX_SEARCH_Q_MAX = 3
     ARMAX_SEARCH_EXCLUDE_00 = True
     # Eligibility rules for model selection in grid search
     ARMAX_SEARCH_REQUIRE_CONVERGENCE = True
@@ -5831,13 +6047,15 @@ if __name__ == "__main__":
     # Fallback ladder if primary order does not converge
     ARMAX_ENABLE_FALLBACK_ORDERS = True
     ARMAX_FALLBACK_ORDERS = [(1, 0, 1), (2, 0, 2), (3, 0, 3)]
+    # Save SE1 ARMAX(1,0,1) exogenous anchor vector (const + wind + controls) to results CSV
+    SAVE_ARMAX_EXOG_ANCHOR = True
     # Baseline ARMAX spec (used when OPTIMIZE_ARMAX_LAGS=False):
     # - order: contiguous ARMA(p,q) component
     # - extra_ar_lags: sparse lagged dependent terms added to exogenous set for baseline run only
     ARMAX_BASELINE_SPEC = {
         'enabled': True,
-        'order': (3, 0, 3),
-        'extra_ar_lags': [23, 24, 25],  # Example: [23, 24, 25]
+        'order': (1, 0, 1),
+        'extra_ar_lags': [],  # Example: [23, 24, 25]
         'drop_initial_nan': True,
         'label': 'ARMAX(3,0,3)'
     }
@@ -5937,7 +6155,7 @@ if __name__ == "__main__":
             zone_hydro=ACTIVE_ZONE,
             use_interpolation=USE_LINEAR_INTERPOLATION,
             start_date='2015-01-01',
-            end_date='2017-12-31',
+            end_date='2025-12-31',
             lag_commodity_hours=LAG_COMMODITY_HOURS
         )
         print(f"Merge successful. Total hourly observations: {len(data)}")
@@ -6106,7 +6324,8 @@ if __name__ == "__main__":
                                       bp_random_seed=BP_RANDOM_SEED,
                                       bp_use_hac_se=BP_USE_HAC_SE,
                                       structural_break_estimation_model=STRUCTURAL_BREAK_ESTIMATION_MODEL,
-                                      armax_baseline_spec=ARMAX_BASELINE_SPEC)
+                                      armax_baseline_spec=ARMAX_BASELINE_SPEC,
+                                      save_armax_exog_anchor=SAVE_ARMAX_EXOG_ANCHOR)
 
     except Exception as e:
         print(f"Critical error during execution: {e}")
