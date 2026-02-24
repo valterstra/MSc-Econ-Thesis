@@ -53,3 +53,5 @@ tmp/
 
 # Keep important files with exceptions
 !README.md
+merger functions/consumption_forecast_merger.py
+merger functions/consumption_forecast_merger.py

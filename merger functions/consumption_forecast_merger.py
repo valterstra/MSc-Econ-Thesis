@@ -3,6 +3,8 @@ import os
 import re
 import pytz
 
+os.chdir('C:\Users\patri\OneDrive - Handelshögskolan i Stockholm\Master Thesis Economics 2025_2026 - General\07_Code and Data')
+
 # --- 1. Configuration ---
 folder_path = 'data/consumption_forecast'
 years_to_include = ['2015', '2016', '2017', '2018', '2019', '2020', '2021', '2022', '2023', '2024', '2025']
