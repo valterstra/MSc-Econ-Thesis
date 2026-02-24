@@ -1,0 +1,17 @@
+================================================================================
+BP STYLE SEQUENTIAL SUPF TREND BREAK SUMMARY - SE1
+================================================================================
+
+Config label: 1y_window_2m_step_trend_bp
+Inference mode: both
+Epsilon (trimming): 0.1
+q restrictions per added break: 2
+Significance level: 0.05
+Bootstrap reps: 999
+Bootstrap block length: 8
+Random seed: 42
+
+Data windows: 61
+Optimal breaks by supF: 3
+Optimal breaks by BIC: 4
+Selected break dates: ['2020-11-01', '2022-07-01', '2023-09-01']

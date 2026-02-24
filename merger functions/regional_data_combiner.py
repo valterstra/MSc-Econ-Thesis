@@ -116,8 +116,9 @@ print(f"  Loading wind forecast for S{region_number}...")
 wind_df = pd.read_excel(wind_forecast_file)
 wind_df['Timestamp'] = pd.to_datetime(wind_df['Timestamp'])
 wind_column = f'S{region_number}_Wind'
-wind_df = wind_df[['Timestamp', wind_column]].copy()
-wind_df.rename(columns={wind_column: 'Wind_Forecast'}, inplace=True)
+total_column = f'S{region_number}_Total'
+wind_df = wind_df[['Timestamp', wind_column, total_column]].copy()
+wind_df.rename(columns={wind_column: 'Wind_Forecast', total_column: 'Total_Forecast'}, inplace=True)
 # Add Occurrence for DST handling
 wind_df['Occurrence'] = wind_df.groupby('Timestamp').cumcount()
 print(f"    Loaded {len(wind_df)} rows")
@@ -173,6 +174,7 @@ for dummy_col in bneck_cols:
 # Add remaining variables
 datasets.extend([
     ('Wind_Forecast', wind_df, 'Wind_Forecast'),
+    ('Total_Forecast', wind_df, 'Total_Forecast'),
     ('Net_Exchange', exchange_df, 'Net_Exchange'),
     ('Consumption_Forecast', consumption_df, 'Consumption_Forecast'),
     ('Hydro_Reserves', hydro_df, 'Hydro_Reserves')
@@ -240,7 +242,7 @@ for name, info in missing_report.items():
 
 # --- 6. REORDER COLUMNS ---
 # Put columns in logical order: Timestamp, Spot_Price, bottleneck dummies, then other variables
-column_order = ['Timestamp', 'Spot_Price'] + bneck_cols + ['Wind_Forecast', 'Net_Exchange', 'Consumption_Forecast', 'Hydro_Reserves']
+column_order = ['Timestamp', 'Spot_Price'] + bneck_cols + ['Wind_Forecast', 'Total_Forecast', 'Net_Exchange', 'Consumption_Forecast', 'Hydro_Reserves']
 combined_df = combined_df[column_order]
 
 # --- 7. SAVE OUTPUT ---

@@ -1,0 +1,24 @@
+================================================================================
+BP STYLE SEQUENTIAL SUPF TREND BREAK SUMMARY - SE4
+================================================================================
+
+Config label: 1y_window_3m_step_trend_bp
+Estimation model: OLS
+Inference mode: tables
+Epsilon (trimming): 0.1
+q restrictions per added break: 2
+Significance level: 0.05
+Bootstrap reps: 999
+Bootstrap block length: 8
+Random seed: 42
+
+Data windows: 1
+Rolling fit diagnostics:
+  Candidate windows: 1
+  Successful windows: 1
+  Failed windows: 0
+    Non-converged: 0
+    Exceptions: 0
+  Used non-converged fits: 0
+Optimal breaks by supF: 0
+Optimal breaks by BIC: 0

@@ -7,7 +7,7 @@ Configuration:
   Rolling window: 1 year(s)
   Step size: 1 month(s)
   Minimum observations per window: 8,040
-  Maximum breaks tested: 3
+  Maximum breaks tested: 4
 
 Data: 121 rolling windows
 
@@ -17,7 +17,8 @@ MODEL COMPARISON (BIC)
   0 breaks: BIC = -922.74
   1 breaks: BIC = -1038.97
   2 breaks: BIC = -1173.28
-  3 breaks: BIC = -1238.35 <-- SELECTED
+  3 breaks: BIC = -1238.35
+  4 breaks: BIC = -1264.69 <-- SELECTED
 
 --------------------------------------------------------------------------------
 SEQUENTIAL F-TESTS
@@ -28,15 +29,18 @@ SEQUENTIAL F-TESTS
     Significant at 5%: YES
   2 vs 3 breaks: F = 48.22, p = 7.7716e-16
     Significant at 5%: YES
+  3 vs 4 breaks: F = 19.19, p = 6.9358e-08
+    Significant at 5%: YES
 
 --------------------------------------------------------------------------------
 SELECTED MODEL
 --------------------------------------------------------------------------------
-Number of breaks: 3
-Break dates: ['2020-10-01', '2022-05-01', '2023-05-01']
+Number of breaks: 4
+Break dates: ['2017-02-01', '2020-10-01', '2022-05-01', '2023-05-01']
 
 Segment details:
-  Segment 1: slope = -0.000143 (SE: 0.000034)
-  Segment 2: slope = -0.004162 (SE: 0.000161)
-  Segment 3: slope = 0.000484 (SE: 0.000465)
-  Segment 4: slope = -0.000362 (SE: 0.000163)
+  Segment 1: slope = -0.001256 (SE: 0.000130)
+  Segment 2: slope = -0.000200 (SE: 0.000042)
+  Segment 3: slope = -0.004162 (SE: 0.000161)
+  Segment 4: slope = 0.000484 (SE: 0.000465)
+  Segment 5: slope = -0.000362 (SE: 0.000163)

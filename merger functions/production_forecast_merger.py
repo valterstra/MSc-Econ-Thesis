@@ -14,6 +14,7 @@ folder_path = f'data/production_forecast_s{region_number}'
 years_to_include = ['2015', '2016', '2017', '2018', '2019', '2020', '2021', '2022', '2023', '2024', '2025']
 output_filename = f'Verified_{target_region}_Wind_Forecast_2015_2025.xlsx'
 column_name = f'{target_region}_Wind'
+column_name_total = f'{target_region}_Total'
 
 # --- 2. Create the Ground Truth (96,360 rows) ---
 tz = pytz.timezone('Europe/Stockholm')
@@ -61,25 +62,35 @@ else:
 for file in files:
     path = os.path.join(folder_path, file)
     try:
-        # Check Row 4 for "Wind Onshore" in Col B or C
-        header = pd.read_excel(path, header=None, skiprows=3, nrows=1, usecols=[1, 2])
-        labels = [str(header.iloc[0, 0]), str(header.iloc[0, 1])]
+        # Scan full header row (Row 4) to find columns dynamically
+        header = pd.read_excel(path, header=None, skiprows=3, nrows=1)
+        wind_col = None
+        total_col = None
+        for idx, label in header.iloc[0].items():
+            label = str(label)
+            if "Wind Onshore" in label:
+                wind_col = idx
+            elif "Day-ahead Total" in label:
+                total_col = idx
 
-        target_col = None
-        if "Wind Onshore" in labels[0]:
-            target_col = 1
-        elif "Wind Onshore" in labels[1]:
-            target_col = 2
-
-        if target_col is None:
-            # If column is missing, we skip data extraction but row stays empty in merge
+        if wind_col is None:
             continue
 
+        # Build list of columns to read
+        use_cols = [0, wind_col]
+        if total_col is not None:
+            use_cols.append(total_col)
+
         # Read hourly data (Rows 6-30)
-        df_raw = pd.read_excel(path, header=None, skiprows=5, nrows=30, usecols=[0, target_col], decimal=',')
+        df_raw = pd.read_excel(path, header=None, skiprows=5, nrows=30, usecols=use_cols, decimal=',')
         # Filter for rows with time periods like "00:00 - 01:00"
         df = df_raw[df_raw[0].astype(str).str.contains(' - ')].copy()
-        df.columns = ['Period', column_name]
+
+        # Rename columns based on what was found
+        if total_col is not None:
+            df.columns = ['Period', column_name, column_name_total]
+        else:
+            df.columns = ['Period', column_name]
 
         # Construct Timestamp
         date_str = re.search(r'\d{4}-\d{2}-\d{2}', file).group(0)
@@ -88,7 +99,10 @@ for file in files:
         # Add Occurrence to handle October duplicates
         df['Occurrence'] = df.groupby('Timestamp').cumcount()
 
-        all_days_data.append(df[['Timestamp', 'Occurrence', column_name]])
+        keep_cols = ['Timestamp', 'Occurrence', column_name]
+        if total_col is not None:
+            keep_cols.append(column_name_total)
+        all_days_data.append(df[keep_cols])
 
     except Exception as e:
         print(f"Error reading {file}: {e}")
