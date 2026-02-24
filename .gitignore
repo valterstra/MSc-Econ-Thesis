@@ -22,6 +22,7 @@ data/
 # Exception: Include master data files
 !master data files/
 !master data files/*.xlsx
+!master data files/**
 
 # Plots (can be regenerated)
 plots/
