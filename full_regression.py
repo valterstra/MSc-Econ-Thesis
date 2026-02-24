@@ -1661,6 +1661,38 @@ def _load_armax_exog_anchor_csv(zone, source_order=(1, 0, 1), results_dir='resul
     return anchor_map if anchor_map else None
 
 
+def _zscore_exog(X_exog):
+    """Z-score exogenous variables column-wise; keep zero-variance cols unchanged."""
+    means = X_exog.mean(axis=0)
+    stds = X_exog.std(axis=0, ddof=0)
+    stds_safe = stds.replace(0, 1.0).fillna(1.0)
+    X_scaled = (X_exog - means) / stds_safe
+    return X_scaled, means, stds_safe
+
+
+def _transform_anchor_raw_to_scaled(exog_anchor_map, means, stds):
+    """
+    Convert raw-scale anchor map (const + exog betas) to scaled-x parameterization.
+    If const is missing, only exog coefficients are transformed.
+    """
+    if not exog_anchor_map:
+        return exog_anchor_map
+
+    out = {}
+    for col in means.index:
+        if col in exog_anchor_map:
+            out[col] = float(exog_anchor_map[col]) * float(stds[col])
+
+    if 'const' in exog_anchor_map:
+        const_scaled = float(exog_anchor_map['const'])
+        for col in means.index:
+            if col in exog_anchor_map:
+                const_scaled += float(exog_anchor_map[col]) * float(means[col])
+        out['const'] = const_scaled
+
+    return out
+
+
 def _attach_inferred_frequency(y, X_exog):
     """
     Attach inferred frequency metadata to datetime index when possible.
@@ -1805,7 +1837,7 @@ def _build_warm_start_params(y_fit, x_fit, order, exog_anchor_map=None):
 
 def _fit_armax_with_controls(y, X_exog, order=(3, 0, 3), context_label="",
                              accept_nonconverged=True, maxiter=300, solver='statespace',
-                             use_warm_start=True, exog_anchor_map=None):
+                             use_warm_start=True, exog_anchor_map=None, scale_exog=False):
     """
     Fit ARMAX quietly and enforce convergence acceptance.
     Returns dict with keys: ok, model, fail_reason, error, freq, converged, diagnostics.
@@ -1819,17 +1851,25 @@ def _fit_armax_with_controls(y, X_exog, order=(3, 0, 3), context_label="",
         'warnflag': None,
         'fopt': None,
         'gradient_max_abs': None,
+        'exog_scaled': bool(scale_exog),
         'context': context_label
     }
 
     try:
+        x_fit_local = x_fit
+        anchor_local = exog_anchor_map
+        if scale_exog:
+            x_fit_local, means, stds = _zscore_exog(x_fit)
+            if exog_anchor_map:
+                anchor_local = _transform_anchor_raw_to_scaled(exog_anchor_map, means, stds)
+
         fit_kwargs = {
             'method': solver,
             'method_kwargs': {'maxiter': maxiter}
         }
         if use_warm_start:
             fit_kwargs['start_params'] = _build_warm_start_params(
-                y_fit, x_fit, order, exog_anchor_map=exog_anchor_map
+                y_fit, x_fit_local, order, exog_anchor_map=anchor_local
             )
 
         with warnings.catch_warnings():
@@ -1856,7 +1896,7 @@ def _fit_armax_with_controls(y, X_exog, order=(3, 0, 3), context_label="",
                 category=UserWarning,
                 message="A date index has been provided, but it has no associated frequency information.*"
             )
-            fitted = sm.tsa.ARIMA(y_fit, exog=x_fit, order=order).fit(**fit_kwargs)
+            fitted = sm.tsa.ARIMA(y_fit, exog=x_fit_local, order=order).fit(**fit_kwargs)
 
         mle_retvals = getattr(fitted, 'mle_retvals', {})
         converged = bool(mle_retvals.get('converged', False))
@@ -1903,7 +1943,7 @@ def _fit_armax_with_controls(y, X_exog, order=(3, 0, 3), context_label="",
 
 def _fit_armax_with_fallback(y, X_exog, primary_order=(3, 0, 3), context_label="",
                              allow_nonconverged=False, maxiter=300, solver='statespace',
-                             use_warm_start=True, enable_fallback_orders=True,
+                             use_warm_start=True, scale_exog=False, enable_fallback_orders=True,
                              fallback_orders=None):
     """
     Fit ARMAX using a fallback ladder. Prefers converged models.
@@ -1928,7 +1968,8 @@ def _fit_armax_with_fallback(y, X_exog, primary_order=(3, 0, 3), context_label="
             accept_nonconverged=True,
             maxiter=maxiter,
             solver=solver,
-            use_warm_start=use_warm_start
+            use_warm_start=use_warm_start,
+            scale_exog=scale_exog
         )
         attempts.append({
             'order': order,
@@ -4231,6 +4272,7 @@ def _evaluate_armax_candidate(Y, exog_vars, p, q,
                             solver='statespace',
                             use_warm_start=True,
                             exog_anchor_map=None,
+                            scale_exog=False,
                             max_p_for_schema=10,
                             max_q_for_schema=10):
     """Evaluate a single ARMAX(p,0,q) candidate without fallback."""
@@ -4294,7 +4336,8 @@ def _evaluate_armax_candidate(Y, exog_vars, p, q,
         maxiter=maxiter,
         solver=solver,
         use_warm_start=use_warm_start,
-        exog_anchor_map=exog_anchor_map
+        exog_anchor_map=exog_anchor_map,
+        scale_exog=scale_exog
     )
 
     if not fit['ok']:
@@ -4489,6 +4532,7 @@ def select_armax_lags_aic(Y, exog_vars, zone='SE1',
                           maxiter=300,
                           solver='statespace',
                           use_warm_start=True,
+                          scale_exog=False,
                           save_top_n=20,
                           results_dir='results'):
     """Strict ARMAX lag search without fallback; returns best order and full results."""
@@ -4535,6 +4579,7 @@ def select_armax_lags_aic(Y, exog_vars, zone='SE1',
             solver=solver,
             use_warm_start=use_warm_start,
             exog_anchor_map=exog_anchor_map,
+            scale_exog=scale_exog,
             max_p_for_schema=max_p_schema,
             max_q_for_schema=max_q_schema
         )
@@ -4593,6 +4638,7 @@ def select_armax_lags_aic_checkpointed(Y, exog_vars, zone='SE1',
                                        maxiter=300,
                                        solver='statespace',
                                        use_warm_start=True,
+                                       scale_exog=False,
                                        save_top_n=20,
                                        results_dir='results'):
     """Checkpointed strict ARMAX lag search (no fallback)."""
@@ -4662,6 +4708,7 @@ def select_armax_lags_aic_checkpointed(Y, exog_vars, zone='SE1',
             solver=solver,
             use_warm_start=use_warm_start,
             exog_anchor_map=exog_anchor_map,
+            scale_exog=scale_exog,
             max_p_for_schema=max_p_schema,
             max_q_for_schema=max_q_schema
         )
@@ -4833,7 +4880,8 @@ def perform_multivariate_analysis(df, zone, target_region='SE1',
                                  bp_use_hac_se=True,
                                  structural_break_estimation_model='ols',
                                  armax_baseline_spec=None,
-                                 save_armax_exog_anchor=False):
+                                 save_armax_exog_anchor=False,
+                                 armax_scale_exog=False):
     """
     Runs OLS, ARMAX, and conditionally GARCH-X with full control variables.
 
@@ -4975,6 +5023,7 @@ def perform_multivariate_analysis(df, zone, target_region='SE1',
                 maxiter=ARMAX_MAXITER,
                 solver=ARMAX_SOLVER,
                 use_warm_start=ARMAX_USE_WARM_START,
+                scale_exog=armax_scale_exog,
                 save_top_n=armax_search_save_top_n
             )
         else:
@@ -4993,6 +5042,7 @@ def perform_multivariate_analysis(df, zone, target_region='SE1',
                 maxiter=ARMAX_MAXITER,
                 solver=ARMAX_SOLVER,
                 use_warm_start=ARMAX_USE_WARM_START,
+                scale_exog=armax_scale_exog,
                 save_top_n=armax_search_save_top_n
             )
         if optimal_order is None:
@@ -5043,6 +5093,7 @@ def perform_multivariate_analysis(df, zone, target_region='SE1',
         maxiter=ARMAX_MAXITER,
         solver=ARMAX_SOLVER,
         use_warm_start=ARMAX_USE_WARM_START,
+        scale_exog=armax_scale_exog,
         enable_fallback_orders=ARMAX_ENABLE_FALLBACK_ORDERS,
         fallback_orders=ARMAX_FALLBACK_ORDERS
     )
@@ -6044,6 +6095,8 @@ if __name__ == "__main__":
     ARMAX_MAXITER = 300
     ARMAX_SOLVER = 'statespace'
     ARMAX_USE_WARM_START = True
+    # Scale exogenous variables to z-scores for ARMAX fitting (improves numerical conditioning)
+    ARMAX_SCALE_EXOG = True
     # Fallback ladder if primary order does not converge
     ARMAX_ENABLE_FALLBACK_ORDERS = True
     ARMAX_FALLBACK_ORDERS = [(1, 0, 1), (2, 0, 2), (3, 0, 3)]
@@ -6325,7 +6378,8 @@ if __name__ == "__main__":
                                       bp_use_hac_se=BP_USE_HAC_SE,
                                       structural_break_estimation_model=STRUCTURAL_BREAK_ESTIMATION_MODEL,
                                       armax_baseline_spec=ARMAX_BASELINE_SPEC,
-                                      save_armax_exog_anchor=SAVE_ARMAX_EXOG_ANCHOR)
+                                      save_armax_exog_anchor=SAVE_ARMAX_EXOG_ANCHOR,
+                                      armax_scale_exog=ARMAX_SCALE_EXOG)
 
     except Exception as e:
         print(f"Critical error during execution: {e}")
