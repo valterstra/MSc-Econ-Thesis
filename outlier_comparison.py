@@ -19,6 +19,20 @@ Figures produced
               overlaid, connector lines show the magnitude of each correction
     Panel 3 – After Gianfreda replacement: same layout
 
+  Figure D  –  outlier_replacement_cleaned.png
+    Same 5-panel layout as Figure B but showing only the cleaned series;
+    original values, grey background line, and connectors are omitted.
+
+  Figure E  –  outlier_gianfreda_4sigma.png
+    Panel 1 – Original series with ±4σ reference thresholds and flagged points
+    Panel 2 – 3σ vs 4σ comparison: borderline (3σ-only) vs confirmed (≥4σ)
+    Panel 3 – Cleaned series after per-weekday ±4σ capping
+
+  Figure F  –  outlier_gianfreda_structural_break.png
+    Panel 1 – Series with structural break date; sub-period μ±σ shaded bands
+    Panel 2 – SB-3σ vs global-3σ detection comparison (both / SB-only / global-only)
+    Panel 3 – Cleaned series after structural-break-aware ±3σ capping
+
   Figure C  –  outlier_cross_method.png
     Panel 1 – Full-window: Both / Fredriksson-only / Gianfreda-only
     Panel 2 – Rolling-window: same three-way split on "flagged in ≥1 window"
@@ -66,7 +80,7 @@ PATHS = {
     'commodities': 'master data files/Master_Commodities.xlsx',
 }
 START_DATE       = '2015-01-01'
-END_DATE         = '2017-12-31'
+END_DATE         = '2025-12-31'
 NEG_PRICE_METHOD = 'shift'           # 'shift' or 'clip'
 
 # Rolling window – overlapping so each point appears in multiple windows.
@@ -117,6 +131,82 @@ def detect_gianfreda(series: pd.Series) -> pd.Series:
     return mask
 
 
+def detect_gianfreda_4sigma(series: pd.Series) -> pd.Series:
+    """True where point exceeds ±4σ of its own weekday's distribution (global)."""
+    mask = pd.Series(False, index=series.index)
+    dow  = series.index.dayofweek
+    for day in range(7):
+        sel      = dow == day
+        day_data = series[sel]
+        if len(day_data) < 2:
+            continue
+        mu, sigma = day_data.mean(), day_data.std()
+        mask[sel] = (series[sel] > mu + 4.0 * sigma) | (series[sel] < mu - 4.0 * sigma)
+    return mask
+
+
+def find_structural_break(series: pd.Series) -> pd.Timestamp:
+    """
+    Find a single mean-shift structural break via the Quandt/QLR criterion:
+    scan all candidate break dates in the central 15%–85% of the sample and
+    return the date that minimises the pooled within-period sum of squared
+    deviations (equivalent to maximising the Chow-test F-statistic for a
+    change in mean).  Uses O(n) vectorised cumulative sums.
+    """
+    n    = len(series)
+    lo   = int(0.15 * n)
+    hi   = int(0.85 * n)
+    vals = series.values
+
+    cumsum  = np.cumsum(vals)
+    cumsum2 = np.cumsum(vals ** 2)
+    total_sum  = cumsum[-1]
+    total_sum2 = cumsum2[-1]
+
+    t_range = np.arange(lo, hi)
+    n1  = t_range
+    n2  = n - t_range
+    s1  = cumsum[t_range - 1]
+    s21 = cumsum2[t_range - 1]
+    s2  = total_sum  - s1
+    s22 = total_sum2 - s21
+
+    ssr = (s21 - s1 ** 2 / n1) + (s22 - s2 ** 2 / n2)
+    best_t = t_range[np.argmin(ssr)]
+    return series.index[best_t]
+
+
+def detect_gianfreda_structural_break(series:     pd.Series,
+                                       break_date: pd.Timestamp) -> pd.Series:
+    """
+    Apply Gianfreda ±3σ per weekday separately on each sub-period defined by
+    `break_date`.  Thresholds are estimated independently on each half so the
+    detection adapts to regime changes in mean and variance.
+
+    Uses purely positional (numpy) indexing to tolerate duplicate timestamps
+    from DST clock-back transitions.
+    """
+    mask_arr  = np.zeros(len(series), dtype=bool)
+    break_pos = series.index.searchsorted(break_date)
+    vals      = series.values
+    dow_all   = series.index.dayofweek
+
+    for start, end in [(0, break_pos), (break_pos, len(series))]:
+        sub_vals = vals[start:end]
+        dow      = dow_all[start:end]
+        for day in range(7):
+            sel      = dow == day
+            day_vals = sub_vals[sel]
+            if len(day_vals) < 2:
+                continue
+            mu, sigma = day_vals.mean(), day_vals.std()
+            flagged   = (day_vals > mu + 3.0 * sigma) | (day_vals < mu - 3.0 * sigma)
+            sub_pos   = np.arange(start, end)
+            mask_arr[sub_pos[sel][flagged]] = True
+
+    return pd.Series(mask_arr, index=series.index)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  REPLACEMENT HELPERS  (return replaced series + boolean mask of changed pts)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -156,6 +246,58 @@ def _apply_gian_replacement(series: pd.Series, mask: pd.Series) -> pd.Series:
         upper, lower = mu + 3.0 * sigma, mu - 3.0 * sigma
         replaced[sel & mask & (series > upper)] = upper
         replaced[sel & mask & (series < lower)] = lower
+    return replaced
+
+
+def _apply_gian4_replacement(series: pd.Series, mask: pd.Series) -> pd.Series:
+    """Cap flagged points at the per-weekday ±4σ boundary (global thresholds)."""
+    replaced = series.copy()
+    dow = series.index.dayofweek
+    for day in range(7):
+        sel      = dow == day
+        day_data = series[sel]
+        if len(day_data) < 2:
+            continue
+        mu, sigma = day_data.mean(), day_data.std()
+        upper, lower = mu + 4.0 * sigma, mu - 4.0 * sigma
+        replaced[sel & mask & (series > upper)] = upper
+        replaced[sel & mask & (series < lower)] = lower
+    return replaced
+
+
+def _apply_gian_sb_replacement(series:     pd.Series,
+                                mask:       pd.Series,
+                                break_date: pd.Timestamp) -> pd.Series:
+    """
+    Cap flagged points at the sub-period per-weekday ±3σ boundary.
+    Thresholds are recomputed independently on each sub-period so that the
+    replacement value matches the regime in which the outlier occurred.
+
+    Uses purely positional (numpy/iloc) indexing to tolerate duplicate
+    timestamps from DST clock-back transitions.
+    """
+    replaced  = series.copy()
+    mask_arr  = mask.values
+    vals      = series.values
+    break_pos = series.index.searchsorted(break_date)
+    dow_all   = series.index.dayofweek
+
+    for start, end in [(0, break_pos), (break_pos, len(series))]:
+        sub_vals = vals[start:end]
+        dow      = dow_all[start:end]
+        for day in range(7):
+            sel      = dow == day
+            day_vals = sub_vals[sel]
+            if len(day_vals) < 2:
+                continue
+            mu, sigma = day_vals.mean(), day_vals.std()
+            upper, lower = mu + 3.0 * sigma, mu - 3.0 * sigma
+            sub_pos  = np.arange(start, end)
+            day_pos  = sub_pos[sel]
+            sub_mask = mask_arr[day_pos]
+            replaced.iloc[day_pos[sub_mask & (day_vals > upper)]] = upper
+            replaced.iloc[day_pos[sub_mask & (day_vals < lower)]] = lower
+
     return replaced
 
 
@@ -494,6 +636,385 @@ def make_figure_B(series:            pd.Series,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  FIGURE D – cleaned series only (no original values shown)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_figure_D(series:            pd.Series,
+                  fred_full_mask:    pd.Series,
+                  gian_full_mask:    pd.Series,
+                  fred_rolling_mask: pd.Series,
+                  gian_rolling_mask: pd.Series) -> None:
+    """
+    5-panel figure showing only the cleaned (post-replacement) series.
+    Identical layout to Figure B but with the original values stripped out:
+      · No grey background line of the raw series
+      · No grey × markers at original outlier positions
+      · No vertical connectors
+    What remains:
+      · Coloured line  = series after replacement
+      · Coloured ★     = position and value of each replacement
+      · Annotation box = count of replaced points
+    """
+    print("  Building Figure D – cleaned series only (no original values) …")
+
+    fred_full_rep    = _apply_fred_replacement(series, fred_full_mask)
+    fred_rolling_rep = _apply_fred_replacement(series, fred_rolling_mask)
+    gian_full_rep    = _apply_gian_replacement(series, gian_full_mask)
+    gian_rolling_rep = _apply_gian_replacement(series, gian_rolling_mask)
+
+    fig, axes = plt.subplots(
+        5, 1, figsize=(18, 28), sharex=True,
+        gridspec_kw={'hspace': 0.08, 'top': 0.965, 'bottom': 0.03,
+                     'left': 0.06, 'right': 0.98},
+    )
+    fig.suptitle(
+        f'Cleaned Series After Outlier Replacement (original values omitted)\n'
+        f'Zone: {ACTIVE_ZONE}  |  {START_DATE} – {END_DATE}  |  '
+        f'Rolling: window={WINDOW_HOURS//24}d, step={STEP_HOURS//24}d',
+        fontsize=13, fontweight='bold',
+    )
+
+    # ── Panel 1: original (reference) ────────────────────────────────────────
+    ax = axes[0]
+    ax.plot(series.index, series.values, color=C_PRICE, lw=0.5, alpha=0.85,
+            label='Price_Log_Deseasonalized (original, no replacement)')
+    ax.set_title('Panel 1 — Original Series  (reference baseline – no outlier replacement)',
+                 fontsize=10, fontweight='bold', loc='left', pad=4)
+    ax.set_ylabel('Deseas. Log Price')
+    ax.legend(fontsize=8, loc='upper right', framealpha=0.8)
+    ax.grid(True, alpha=0.20)
+
+    def _draw_cleaned_panel(ax, replaced, mask, line_color, scope_label):
+        """Draw only the post-replacement series; original values not shown."""
+        ax.plot(replaced.index, replaced.values,
+                color=line_color, lw=0.5, alpha=0.85,
+                label=f'After replacement  ({scope_label})')
+
+        if mask.sum() > 0:
+            repl_vals = replaced[mask].values
+            dates     = replaced.index[mask]
+
+            ax.scatter(dates, repl_vals,
+                       color=line_color, marker='*', s=55, linewidths=0,
+                       zorder=5, label=f'Replacement position  (n={mask.sum()})')
+
+            ax.annotate(
+                f'Points replaced : {mask.sum()}',
+                xy=(0.01, 0.97), xycoords='axes fraction',
+                va='top', fontsize=8,
+                bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.80),
+            )
+        else:
+            ax.annotate('No points replaced', xy=(0.01, 0.97),
+                        xycoords='axes fraction', va='top', fontsize=8,
+                        bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.80))
+
+        ax.set_ylabel('Deseas. Log Price')
+        ax.legend(fontsize=8, ncol=2, loc='upper right', framealpha=0.85)
+        ax.grid(True, alpha=0.20)
+
+    # ── Panel 2: Fredriksson – full-window flags ──────────────────────────────
+    ax = axes[1]
+    _draw_cleaned_panel(ax, fred_full_rep, fred_full_mask, C_FRED, 'full-window flags')
+    ax.set_title(
+        f'Panel 2 — Fredriksson  |  Full-Window Flags  '
+        f'[+6σ/−3.7σ global → mean ±24h/±48h]  '
+        f'({fred_full_mask.sum()} replaced)',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+
+    # ── Panel 3: Fredriksson – rolling-window flags ───────────────────────────
+    ax = axes[2]
+    _draw_cleaned_panel(ax, fred_rolling_rep, fred_rolling_mask, C_FRED, 'rolling-window flags')
+    ax.set_title(
+        f'Panel 3 — Fredriksson  |  Rolling-Window Flags  '
+        f'[flagged in ≥1 window → same ±24h/±48h replacement]  '
+        f'({fred_rolling_mask.sum()} replaced)',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+
+    # ── Panel 4: Gianfreda – full-window flags ────────────────────────────────
+    ax = axes[3]
+    _draw_cleaned_panel(ax, gian_full_rep, gian_full_mask, C_GIAN, 'full-window flags')
+    ax.set_title(
+        f'Panel 4 — Gianfreda  |  Full-Window Flags  '
+        f'[±3σ per weekday global → capped at threshold]  '
+        f'({gian_full_mask.sum()} replaced)',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+
+    # ── Panel 5: Gianfreda – rolling-window flags ─────────────────────────────
+    ax = axes[4]
+    _draw_cleaned_panel(ax, gian_rolling_rep, gian_rolling_mask, C_GIAN, 'rolling-window flags')
+    ax.set_title(
+        f'Panel 5 — Gianfreda  |  Rolling-Window Flags  '
+        f'[flagged in ≥1 window → same weekday-cap replacement]  '
+        f'({gian_rolling_mask.sum()} replaced)',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_xlabel('Date')
+
+    _save(fig, 'outlier_replacement_cleaned.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FIGURE E – Gianfreda ±4σ threshold (relaxed, global per weekday)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_figure_E(series:       pd.Series,
+                  gian_3s_mask: pd.Series,
+                  gian_4s_mask: pd.Series) -> None:
+    """
+    3-panel figure for Gianfreda with a relaxed ±4σ threshold applied to the
+    whole series (global per-weekday thresholds).
+
+    Panel 1 – Original series with overall ±4σ reference lines and flagged points
+    Panel 2 – 3σ vs 4σ comparison: borderline (flagged by 3σ but not 4σ)
+              vs confirmed (flagged by ≥4σ)
+    Panel 3 – Cleaned series after per-weekday ±4σ capping
+    """
+    print("  Building Figure E – Gianfreda ±4σ …")
+
+    replaced_4s = _apply_gian4_replacement(series, gian_4s_mask)
+
+    # Comparison masks: between 3σ-4σ (borderline) vs beyond 4σ (confirmed)
+    borderline = gian_3s_mask & ~gian_4s_mask   # flagged by 3σ but not 4σ
+    confirmed  = gian_4s_mask                    # flagged by ≥4σ (subset of 3σ)
+
+    # Overall thresholds for reference lines (not used for detection)
+    mu_all, sigma_all = series.mean(), series.std()
+
+    print(f"    ±3σ global  : {gian_3s_mask.sum():5d} flagged")
+    print(f"    ±4σ global  : {gian_4s_mask.sum():5d} flagged")
+    print(f"    Borderline (3σ-only): {borderline.sum()}  |  Confirmed (≥4σ): {confirmed.sum()}")
+
+    fig, axes = plt.subplots(
+        3, 1, figsize=(18, 18), sharex=True,
+        gridspec_kw={'hspace': 0.08, 'top': 0.960, 'bottom': 0.04,
+                     'left': 0.06, 'right': 0.98},
+    )
+    fig.suptitle(
+        f'Gianfreda Outlier Detection – Relaxed ±4σ Threshold (per weekday, global)\n'
+        f'Zone: {ACTIVE_ZONE}  |  {START_DATE} – {END_DATE}  |  '
+        f'{len(series):,} hourly observations',
+        fontsize=13, fontweight='bold',
+    )
+    sk = dict(zorder=5, linewidths=0, s=12)
+
+    # ── Panel 1: original + ±4σ reference lines + flagged points ─────────────
+    ax = axes[0]
+    ax.plot(series.index, series.values, color=C_PRICE, lw=0.4, alpha=0.70,
+            label='Price_Log_Deseas.')
+    if gian_4s_mask.sum() > 0:
+        ax.scatter(series.index[gian_4s_mask], series.values[gian_4s_mask],
+                   color=C_FULL_ONLY, label=f'Flagged ±4σ  (n={gian_4s_mask.sum()})', **sk)
+    ax.axhline(mu_all + 4.0 * sigma_all, color=C_THRESHOLD, ls='--', lw=0.9, alpha=0.8,
+               label=f'+4σ (overall) = {mu_all+4*sigma_all:.2f}')
+    ax.axhline(mu_all - 4.0 * sigma_all, color=C_THRESHOLD, ls=':', lw=0.9, alpha=0.8,
+               label=f'−4σ (overall) = {mu_all-4*sigma_all:.2f}')
+    ax.set_title(
+        'Panel 1 — Full-Spectrum Outliers  [±4σ per weekday, global thresholds]'
+        '  (overall ±4σ lines shown for reference)',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.legend(fontsize=8, ncol=4, loc='upper right', framealpha=0.8)
+    ax.grid(True, alpha=0.20)
+
+    # ── Panel 2: borderline vs confirmed ─────────────────────────────────────
+    ax = axes[1]
+    ax.plot(series.index, series.values, color=C_PRICE, lw=0.4, alpha=0.45)
+    for mask, col, lbl in [
+        (borderline, C_FRED,      f'Borderline: 3σ-only  (n={borderline.sum()})'),
+        (confirmed,  C_FULL_ONLY, f'Confirmed: ≥4σ  (n={confirmed.sum()})'),
+    ]:
+        if mask.sum() > 0:
+            ax.scatter(series.index[mask], series.values[mask], color=col, label=lbl, **sk)
+    ax.axhline(mu_all + 3.0 * sigma_all, color='#888888', ls='--', lw=0.7, alpha=0.6,
+               label='±3σ (overall, ref.)')
+    ax.axhline(mu_all - 3.0 * sigma_all, color='#888888', ls=':', lw=0.7, alpha=0.6)
+    ax.axhline(mu_all + 4.0 * sigma_all, color=C_THRESHOLD, ls='--', lw=0.7, alpha=0.6,
+               label='±4σ (overall, ref.)')
+    ax.axhline(mu_all - 4.0 * sigma_all, color=C_THRESHOLD, ls=':', lw=0.7, alpha=0.6)
+    ax.annotate(
+        f'Borderline (3σ < |x| ≤ 4σ) : {borderline.sum()}\n'
+        f'Confirmed  (|x| > 4σ)       : {confirmed.sum()}',
+        xy=(0.01, 0.97), xycoords='axes fraction',
+        va='top', fontsize=8,
+        bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.80),
+    )
+    ax.set_title(
+        'Panel 2 — 3σ vs 4σ Comparison  '
+        '[orange = borderline (between 3σ–4σ)  |  red = confirmed (beyond 4σ)]',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.legend(fontsize=8, ncol=3, loc='upper right', framealpha=0.85)
+    ax.grid(True, alpha=0.20)
+
+    # ── Panel 3: cleaned series ───────────────────────────────────────────────
+    ax = axes[2]
+    ax.plot(replaced_4s.index, replaced_4s.values, color=C_GIAN, lw=0.5, alpha=0.85,
+            label=f'After ±4σ replacement  ({gian_4s_mask.sum()} points)')
+    if gian_4s_mask.sum() > 0:
+        ax.scatter(series.index[gian_4s_mask], replaced_4s.values[gian_4s_mask],
+                   color=C_GIAN, marker='*', s=55, linewidths=0,
+                   zorder=5, label='Replacement position')
+    ax.set_title(
+        'Panel 3 — Cleaned Series After ±4σ Replacement  (capped at per-weekday ±4σ boundary)',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.set_xlabel('Date')
+    ax.legend(fontsize=8, ncol=2, loc='upper right', framealpha=0.85)
+    ax.grid(True, alpha=0.20)
+
+    _save(fig, 'outlier_gianfreda_4sigma.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FIGURE F – Gianfreda ±3σ with structural break
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_figure_F(series:       pd.Series,
+                  break_date:   pd.Timestamp,
+                  gian_sb_mask: pd.Series,
+                  gian_3s_mask: pd.Series) -> None:
+    """
+    3-panel figure for Gianfreda ±3σ with a structural break.
+
+    Panel 1 – Series with break date marked; sub-period mean ± σ shaded bands
+              show the regime shift in distribution
+    Panel 2 – Flagged outliers coloured by detection outcome:
+              SB-only (new detections from structural-break method),
+              global-only (missed by SB method),
+              both methods
+    Panel 3 – Cleaned series after structural-break-aware ±3σ capping
+    """
+    print("  Building Figure F – Gianfreda structural-break ±3σ …")
+
+    replaced_sb = _apply_gian_sb_replacement(series, gian_sb_mask, break_date)
+
+    pre  = series[series.index <  break_date]
+    post = series[series.index >= break_date]
+    mu_pre,  sigma_pre  = pre.mean(),  pre.std()
+    mu_post, sigma_post = post.mean(), post.std()
+
+    sb_only     = gian_sb_mask  & ~gian_3s_mask
+    global_only = ~gian_sb_mask &  gian_3s_mask
+    both        = gian_sb_mask  &  gian_3s_mask
+
+    print(f"    Break date       : {break_date.date()}")
+    print(f"    Pre-break  n={len(pre):,}  μ={mu_pre:.3f}  σ={sigma_pre:.3f}")
+    print(f"    Post-break n={len(post):,}  μ={mu_post:.3f}  σ={sigma_post:.3f}")
+    print(f"    SB-3σ flagged : {gian_sb_mask.sum()}  |  Global-3σ : {gian_3s_mask.sum()}")
+    print(f"    SB-only: {sb_only.sum()}  |  global-only: {global_only.sum()}  |  both: {both.sum()}")
+
+    fig, axes = plt.subplots(
+        3, 1, figsize=(18, 18), sharex=True,
+        gridspec_kw={'hspace': 0.08, 'top': 0.960, 'bottom': 0.04,
+                     'left': 0.06, 'right': 0.98},
+    )
+    fig.suptitle(
+        f'Gianfreda Outlier Detection – ±3σ with Structural Break\n'
+        f'Zone: {ACTIVE_ZONE}  |  {START_DATE} – {END_DATE}  |  '
+        f'Break: {break_date.strftime("%Y-%m-%d")}',
+        fontsize=13, fontweight='bold',
+    )
+    sk = dict(zorder=5, linewidths=0, s=12)
+    C_PRE  = '#4477AA'   # steel blue  – pre-break sub-period
+    C_POST = '#E55C00'   # orange      – post-break sub-period
+
+    # ── Panel 1: regime shift visualisation ───────────────────────────────────
+    ax = axes[0]
+    ax.plot(series.index, series.values, color=C_PRICE, lw=0.4, alpha=0.70,
+            label='Price_Log_Deseas.')
+
+    # Shaded μ±σ bands per sub-period
+    ax.axhspan(mu_pre  - sigma_pre,  mu_pre  + sigma_pre,
+               xmin=0.0, xmax=(len(pre) / len(series)),
+               color=C_PRE,  alpha=0.08, label=f'Pre-break μ±σ  [{pre.index[0].date()} – {pre.index[-1].date()}]')
+    ax.axhspan(mu_post - sigma_post, mu_post + sigma_post,
+               xmin=(len(pre) / len(series)), xmax=1.0,
+               color=C_POST, alpha=0.08, label=f'Post-break μ±σ  [{post.index[0].date()} – {post.index[-1].date()}]')
+
+    # Sub-period mean lines
+    ax.hlines(mu_pre,  pre.index[0],  pre.index[-1],
+              colors=C_PRE,  linestyles='--', lw=1.0, alpha=0.70, zorder=3)
+    ax.hlines(mu_post, post.index[0], post.index[-1],
+              colors=C_POST, linestyles='--', lw=1.0, alpha=0.70, zorder=3)
+
+    # Break date vertical line
+    ax.axvline(break_date, color='black', lw=1.2, ls='-', alpha=0.85, zorder=4,
+               label=f'Structural break: {break_date.strftime("%Y-%m-%d")}')
+    ax.annotate(
+        f'Pre-break:   μ={mu_pre:.3f},  σ={sigma_pre:.3f}\n'
+        f'Post-break:  μ={mu_post:.3f},  σ={sigma_post:.3f}\n'
+        f'Δμ = {mu_post - mu_pre:+.3f}   Δσ = {sigma_post - sigma_pre:+.3f}',
+        xy=(0.01, 0.97), xycoords='axes fraction',
+        va='top', fontsize=8,
+        bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.85),
+    )
+    ax.set_title(
+        f'Panel 1 — Structural Break & Regime Shift  '
+        f'(break at {break_date.strftime("%Y-%m-%d")}  |  Quandt/QLR criterion)',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.legend(fontsize=8, ncol=2, loc='upper right', framealpha=0.85)
+    ax.grid(True, alpha=0.20)
+
+    # ── Panel 2: SB detection vs global detection comparison ─────────────────
+    ax = axes[1]
+    ax.plot(series.index, series.values, color=C_PRICE, lw=0.4, alpha=0.45)
+    ax.axvline(break_date, color='black', lw=0.9, ls='--', alpha=0.50, zorder=3)
+    for mask, col, lbl in [
+        (both,        C_BOTH,         f'Both methods  (n={both.sum()})'),
+        (sb_only,     C_PRE,          f'SB-3σ only (new detections)  (n={sb_only.sum()})'),
+        (global_only, C_FULL_ONLY,    f'Global-3σ only (missed by SB)  (n={global_only.sum()})'),
+    ]:
+        if mask.sum() > 0:
+            ax.scatter(series.index[mask], series.values[mask], color=col, label=lbl, **sk)
+    ax.annotate(
+        f'Both methods  : {both.sum()}\n'
+        f'SB-only       : {sb_only.sum()}\n'
+        f'Global-only   : {global_only.sum()}',
+        xy=(0.01, 0.97), xycoords='axes fraction',
+        va='top', fontsize=8,
+        bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.80),
+    )
+    ax.set_title(
+        'Panel 2 — SB-3σ vs Global-3σ Detection Comparison  '
+        '[purple=both  |  blue=SB-only  |  red=global-only]',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.legend(fontsize=8, ncol=3, loc='upper right', framealpha=0.85)
+    ax.grid(True, alpha=0.20)
+
+    # ── Panel 3: cleaned series ───────────────────────────────────────────────
+    ax = axes[2]
+    ax.plot(replaced_sb.index, replaced_sb.values, color=C_PRICE, lw=0.5, alpha=0.85,
+            label=f'After SB-3σ replacement  ({gian_sb_mask.sum()} points)')
+    ax.axvline(break_date, color='black', lw=0.9, ls='--', alpha=0.50, zorder=3,
+               label=f'Break: {break_date.strftime("%Y-%m-%d")}')
+    if gian_sb_mask.sum() > 0:
+        ax.scatter(series.index[gian_sb_mask], replaced_sb.values[gian_sb_mask],
+                   color=C_BOTH, marker='*', s=55, linewidths=0,
+                   zorder=5, label='Replacement position')
+    ax.set_title(
+        'Panel 3 — Cleaned Series After Structural-Break ±3σ Replacement',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.set_xlabel('Date')
+    ax.legend(fontsize=8, ncol=2, loc='upper right', framealpha=0.85)
+    ax.grid(True, alpha=0.20)
+
+    _save(fig, 'outlier_gianfreda_structural_break.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  FIGURE C – cross-method comparison (Fredriksson vs. Gianfreda)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -614,10 +1135,12 @@ if __name__ == '__main__':
     print(f"      {len(raw):,} hourly observations loaded.")
 
     print("\n[2/4] Preprocessing (negative handling → log → deseasonalize) …")
-    data = handle_negative_prices(raw.copy(), method=NEG_PRICE_METHOD)
+    data = handle_negative_prices(raw, method=NEG_PRICE_METHOD)  # raw.copy() is redundant (handle_negative_prices copies internally)
+    del raw  # free raw DataFrame before OLS allocations in deseasonalize_logged_variables
     data = apply_log_transform(data, save_temp_plots=False)
     data = deseasonalize_logged_variables(data, save_temp_plots=False)
     series = data['Price_Log_Deseasonalized'].dropna()
+    del data  # only series is needed from here on
     print(f"      Price_Log_Deseasonalized ready: {len(series):,} observations.")
 
     # ── 2. Pre-compute everything (avoid running rolling detection twice) ──────
@@ -626,8 +1149,18 @@ if __name__ == '__main__':
     print("  Full-spectrum – Fredriksson …")
     fred_full_mask = detect_fredriksson(series)
 
-    print("  Full-spectrum – Gianfreda …")
+    print("  Full-spectrum – Gianfreda ±3σ …")
     gian_full_mask = detect_gianfreda(series)
+
+    print("  Full-spectrum – Gianfreda ±4σ (relaxed) …")
+    gian_4s_mask = detect_gianfreda_4sigma(series)
+
+    print("  Structural break detection (Quandt/QLR criterion) …")
+    break_date = find_structural_break(series)
+    print(f"    Break detected at: {break_date.date()}")
+
+    print("  Full-spectrum – Gianfreda ±3σ structural-break-aware …")
+    gian_sb_mask = detect_gianfreda_structural_break(series, break_date)
 
     print(f"  Rolling-window – Fredriksson  "
           f"(window={WINDOW_HOURS//24}d, step={STEP_HOURS//24}d) …")
@@ -638,7 +1171,7 @@ if __name__ == '__main__':
     gian_counts       = rolling_outlier_counts(series, 'gianfreda')
     gian_rolling_mask = gian_counts['flagged'] > 0
 
-    # (replacements are computed inside make_figure_B from the pre-detected masks)
+    # (replacements are computed inside make_figure_B/D from the pre-detected masks)
 
     # ── 3. Generate all figures ───────────────────────────────────────────────
     print("\n[4/4] Generating figures …")
@@ -657,8 +1190,22 @@ if __name__ == '__main__':
                   fred_full_mask,    gian_full_mask,
                   fred_rolling_mask, gian_rolling_mask)
 
+    # Figure D: cleaned series only (no original values shown)
+    make_figure_D(series,
+                  fred_full_mask,    gian_full_mask,
+                  fred_rolling_mask, gian_rolling_mask)
+
+    # Figure E: Gianfreda ±4σ relaxed threshold
+    make_figure_E(series, gian_full_mask, gian_4s_mask)
+
+    # Figure F: Gianfreda ±3σ structural-break-aware
+    make_figure_F(series, break_date, gian_sb_mask, gian_full_mask)
+
     print(f"\nDone. All figures saved to:  {OUTPUT_DIR}/")
     print("  outlier_comparison_fredriksson.png")
     print("  outlier_comparison_gianfreda.png")
     print("  outlier_replacement.png")
+    print("  outlier_replacement_cleaned.png")
     print("  outlier_cross_method.png")
+    print("  outlier_gianfreda_4sigma.png")
+    print("  outlier_gianfreda_structural_break.png")
