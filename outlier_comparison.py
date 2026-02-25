@@ -33,6 +33,35 @@ Figures produced
     Panel 2 – SB-3σ vs global-3σ detection comparison (both / SB-only / global-only)
     Panel 3 – Cleaned series after structural-break-aware ±3σ capping
 
+  Figure G  –  outlier_gianfreda_manual_break.png
+    Same 3-panel layout as Figure F but break date manually set to 2021-10-01
+    (energy-crisis onset) instead of the QLR-detected date
+
+  Figure H  –  outlier_gianfreda_robust_sb.png
+    Gianfreda ±3σ̂_robust (MAD-based, 1.4826×MAD) with QLR structural break
+    Panel 1 – Regime shift: median ± 3*σ̂_robust bands per sub-period
+    Panel 2 – Robust-SB-3σ̂ vs standard-global-3σ comparison
+    Panel 3 – Cleaned series after robust-SB capping
+
+  Figure I  –  outlier_gianfreda_robust.png
+    Gianfreda ±3σ̂_robust (MAD-based) applied globally (no structural break)
+    Panel 1 – Series with overall ±3σ̂_rob reference lines and flagged points
+    Panel 2 – Robust ±3σ̂ vs standard ±3σ comparison (robust-only / std-only / both)
+    Panel 3 – Cleaned series after per-weekday robust ±3σ̂ capping
+
+  Figure J  –  outlier_gianfreda_manual_break_4sigma.png
+    Gianfreda ±4σ per weekday computed within each regime (manual break 2021-10-01)
+    Panel 1 – Regime shift at the manual break; sub-period μ±σ shaded bands
+    Panel 2 – Per-regime ±3σ vs ±4σ comparison: borderline (3σ-only) vs confirmed (≥4σ)
+    Panel 3 – Cleaned series after manual-SB ±4σ per-weekday capping
+
+  Figure K  –  outlier_gianfreda_all_variants.png
+    6-panel summary comparing all Gianfreda cleaning variants:
+    Panels 1–3: 3σ global / 3σ manual break / 3σ QLR break
+    Panels 4–6: 4σ global / 4σ manual break / 4σ QLR break
+    Each panel shows the cleaned series with replacement markers and an
+    annotation box reporting total replaced + pre/post-break counts
+
   Figure C  –  outlier_cross_method.png
     Panel 1 – Full-window: Both / Fredriksson-only / Gianfreda-only
     Panel 2 – Rolling-window: same three-way split on "flagged in ≥1 window"
@@ -44,6 +73,7 @@ Usage
 Requires data files at the PATHS configured below (same layout as main.py).
 """
 
+import gc
 import os
 import sys
 import warnings
@@ -207,6 +237,101 @@ def detect_gianfreda_structural_break(series:     pd.Series,
     return pd.Series(mask_arr, index=series.index)
 
 
+MAD_SCALE = 1.4826   # Consistency factor: σ̂_robust = MAD_SCALE × MAD ≈ σ under normality
+                     # (Uniejewski et al. 2018; Rousseeuw & Croux 1993)
+
+
+def detect_gianfreda_robust(series: pd.Series) -> pd.Series:
+    """
+    Gianfreda per-weekday outlier detection using a robust σ̂ estimator.
+    σ̂_robust = 1.4826 × MAD  (Median Absolute Deviation, scaled for normality).
+    Flags points beyond ±3σ̂_robust of their own weekday's median.
+    The MAD is insensitive to extreme observations so thresholds are not
+    inflated by the very outliers we seek to remove (Uniejewski et al. 2018).
+    """
+    mask = pd.Series(False, index=series.index)
+    dow  = series.index.dayofweek
+    for day in range(7):
+        sel      = dow == day
+        day_data = series[sel]
+        if len(day_data) < 2:
+            continue
+        med       = day_data.median()
+        mad       = (day_data - med).abs().median()
+        sigma_rob = MAD_SCALE * mad
+        if sigma_rob == 0:
+            continue
+        mask[sel] = (series[sel] > med + 3.0 * sigma_rob) | \
+                    (series[sel] < med - 3.0 * sigma_rob)
+    return mask
+
+
+def detect_gianfreda_robust_structural_break(series:     pd.Series,
+                                              break_date: pd.Timestamp) -> pd.Series:
+    """
+    Gianfreda ±3σ̂_robust detection applied separately on each sub-period
+    defined by `break_date`.  Uses MAD-based σ̂ per weekday per sub-period.
+
+    Uses purely positional (numpy) indexing to tolerate duplicate timestamps
+    from DST clock-back transitions.
+    """
+    mask_arr  = np.zeros(len(series), dtype=bool)
+    break_pos = series.index.searchsorted(break_date)
+    vals      = series.values
+    dow_all   = series.index.dayofweek
+
+    for start, end in [(0, break_pos), (break_pos, len(series))]:
+        sub_vals = vals[start:end]
+        dow      = dow_all[start:end]
+        for day in range(7):
+            sel      = dow == day
+            day_vals = sub_vals[sel]
+            if len(day_vals) < 2:
+                continue
+            med       = np.median(day_vals)
+            mad       = np.median(np.abs(day_vals - med))
+            sigma_rob = MAD_SCALE * mad
+            if sigma_rob == 0:
+                continue
+            flagged = (day_vals > med + 3.0 * sigma_rob) | \
+                      (day_vals < med - 3.0 * sigma_rob)
+            sub_pos = np.arange(start, end)
+            mask_arr[sub_pos[sel][flagged]] = True
+
+    return pd.Series(mask_arr, index=series.index)
+
+
+def detect_gianfreda_4sigma_structural_break(series:     pd.Series,
+                                              break_date: pd.Timestamp) -> pd.Series:
+    """
+    Gianfreda ±4σ detection applied separately on each sub-period defined by
+    `break_date`.  Standard deviation is computed per weekday per sub-period,
+    so the threshold adapts to each regime's own scale.
+
+    Uses purely positional (numpy) indexing to tolerate duplicate timestamps
+    from DST clock-back transitions.
+    """
+    mask_arr  = np.zeros(len(series), dtype=bool)
+    break_pos = series.index.searchsorted(break_date)
+    vals      = series.values
+    dow_all   = series.index.dayofweek
+
+    for start, end in [(0, break_pos), (break_pos, len(series))]:
+        sub_vals = vals[start:end]
+        dow      = dow_all[start:end]
+        for day in range(7):
+            sel      = dow == day
+            day_vals = sub_vals[sel]
+            if len(day_vals) < 2:
+                continue
+            mu, sigma = day_vals.mean(), day_vals.std()
+            flagged   = (day_vals > mu + 4.0 * sigma) | (day_vals < mu - 4.0 * sigma)
+            sub_pos   = np.arange(start, end)
+            mask_arr[sub_pos[sel][flagged]] = True
+
+    return pd.Series(mask_arr, index=series.index)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  REPLACEMENT HELPERS  (return replaced series + boolean mask of changed pts)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -292,6 +417,101 @@ def _apply_gian_sb_replacement(series:     pd.Series,
                 continue
             mu, sigma = day_vals.mean(), day_vals.std()
             upper, lower = mu + 3.0 * sigma, mu - 3.0 * sigma
+            sub_pos  = np.arange(start, end)
+            day_pos  = sub_pos[sel]
+            sub_mask = mask_arr[day_pos]
+            replaced.iloc[day_pos[sub_mask & (day_vals > upper)]] = upper
+            replaced.iloc[day_pos[sub_mask & (day_vals < lower)]] = lower
+
+    return replaced
+
+
+def _apply_gian_robust_replacement(series: pd.Series, mask: pd.Series) -> pd.Series:
+    """Cap flagged points at the per-weekday median ± 3*σ̂_robust boundary (global)."""
+    replaced = series.copy()
+    dow = series.index.dayofweek
+    for day in range(7):
+        sel      = dow == day
+        day_data = series[sel]
+        if len(day_data) < 2:
+            continue
+        med       = day_data.median()
+        mad       = (day_data - med).abs().median()
+        sigma_rob = MAD_SCALE * mad
+        if sigma_rob == 0:
+            continue
+        upper, lower = med + 3.0 * sigma_rob, med - 3.0 * sigma_rob
+        replaced[sel & mask & (series > upper)] = upper
+        replaced[sel & mask & (series < lower)] = lower
+    return replaced
+
+
+def _apply_gian_robust_sb_replacement(series:     pd.Series,
+                                       mask:       pd.Series,
+                                       break_date: pd.Timestamp) -> pd.Series:
+    """
+    Cap flagged points at the sub-period per-weekday median ± 3*σ̂_robust boundary.
+    Thresholds are recomputed with MAD independently on each sub-period.
+
+    Uses purely positional (numpy/iloc) indexing to tolerate duplicate
+    timestamps from DST clock-back transitions.
+    """
+    replaced  = series.copy()
+    mask_arr  = mask.values
+    vals      = series.values
+    break_pos = series.index.searchsorted(break_date)
+    dow_all   = series.index.dayofweek
+
+    for start, end in [(0, break_pos), (break_pos, len(series))]:
+        sub_vals = vals[start:end]
+        dow      = dow_all[start:end]
+        for day in range(7):
+            sel      = dow == day
+            day_vals = sub_vals[sel]
+            if len(day_vals) < 2:
+                continue
+            med       = np.median(day_vals)
+            mad       = np.median(np.abs(day_vals - med))
+            sigma_rob = MAD_SCALE * mad
+            if sigma_rob == 0:
+                continue
+            upper, lower = med + 3.0 * sigma_rob, med - 3.0 * sigma_rob
+            sub_pos  = np.arange(start, end)
+            day_pos  = sub_pos[sel]
+            sub_mask = mask_arr[day_pos]
+            replaced.iloc[day_pos[sub_mask & (day_vals > upper)]] = upper
+            replaced.iloc[day_pos[sub_mask & (day_vals < lower)]] = lower
+
+    return replaced
+
+
+def _apply_gian4_sb_replacement(series:     pd.Series,
+                                 mask:       pd.Series,
+                                 break_date: pd.Timestamp) -> pd.Series:
+    """
+    Cap flagged points at the sub-period per-weekday ±4σ boundary.
+    Standard deviation is estimated independently on each sub-period so the
+    cap value matches the regime in which the outlier occurred.
+
+    Uses purely positional (numpy/iloc) indexing to tolerate duplicate
+    timestamps from DST clock-back transitions.
+    """
+    replaced  = series.copy()
+    mask_arr  = mask.values
+    vals      = series.values
+    break_pos = series.index.searchsorted(break_date)
+    dow_all   = series.index.dayofweek
+
+    for start, end in [(0, break_pos), (break_pos, len(series))]:
+        sub_vals = vals[start:end]
+        dow      = dow_all[start:end]
+        for day in range(7):
+            sel      = dow == day
+            day_vals = sub_vals[sel]
+            if len(day_vals) < 2:
+                continue
+            mu, sigma = day_vals.mean(), day_vals.std()
+            upper, lower = mu + 4.0 * sigma, mu - 4.0 * sigma
             sub_pos  = np.arange(start, end)
             day_pos  = sub_pos[sel]
             sub_mask = mask_arr[day_pos]
@@ -1015,6 +1235,667 @@ def make_figure_F(series:       pd.Series,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  FIGURE G – Gianfreda ±3σ with manually set structural break (2021-10-01)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_figure_G(series:           pd.Series,
+                  gian_manual_mask: pd.Series,
+                  gian_3s_mask:     pd.Series,
+                  manual_break:     pd.Timestamp) -> None:
+    """
+    Identical layout to Figure F but the structural break is manually set to
+    2021-10-01 (the energy-crisis onset) rather than chosen by the QLR criterion.
+
+    Panel 1 – Regime shift at the manual break date; sub-period μ±σ shaded bands
+    Panel 2 – Manual-SB-3σ vs global-3σ comparison (both / manual-only / global-only)
+    Panel 3 – Cleaned series after manual-SB ±3σ capping
+    """
+    print("  Building Figure G – Gianfreda manual break (2021-10-01) ±3σ …")
+
+    replaced_mb = _apply_gian_sb_replacement(series, gian_manual_mask, manual_break)
+
+    pre  = series[series.index <  manual_break]
+    post = series[series.index >= manual_break]
+    mu_pre,  sigma_pre  = pre.mean(),  pre.std()
+    mu_post, sigma_post = post.mean(), post.std()
+
+    mb_only     = gian_manual_mask & ~gian_3s_mask
+    global_only = ~gian_manual_mask &  gian_3s_mask
+    both        = gian_manual_mask  &  gian_3s_mask
+
+    print(f"    Manual break     : {manual_break.date()}")
+    print(f"    Pre-break  n={len(pre):,}  μ={mu_pre:.3f}  σ={sigma_pre:.3f}")
+    print(f"    Post-break n={len(post):,}  μ={mu_post:.3f}  σ={sigma_post:.3f}")
+    print(f"    Manual-SB-3σ flagged : {gian_manual_mask.sum()}  |  Global-3σ : {gian_3s_mask.sum()}")
+    print(f"    MB-only: {mb_only.sum()}  |  global-only: {global_only.sum()}  |  both: {both.sum()}")
+
+    fig, axes = plt.subplots(
+        3, 1, figsize=(18, 18), sharex=True,
+        gridspec_kw={'hspace': 0.08, 'top': 0.960, 'bottom': 0.04,
+                     'left': 0.06, 'right': 0.98},
+    )
+    fig.suptitle(
+        f'Gianfreda Outlier Detection – ±3σ with Manual Structural Break\n'
+        f'Zone: {ACTIVE_ZONE}  |  {START_DATE} – {END_DATE}  |  '
+        f'Break: {manual_break.strftime("%Y-%m-%d")}  (manually set — energy-crisis onset)',
+        fontsize=13, fontweight='bold',
+    )
+    sk = dict(zorder=5, linewidths=0, s=12)
+    C_PRE  = '#4477AA'
+    C_POST = '#E55C00'
+
+    # ── Panel 1: regime shift ──────────────────────────────────────────────────
+    ax = axes[0]
+    ax.plot(series.index, series.values, color=C_PRICE, lw=0.4, alpha=0.70,
+            label='Price_Log_Deseas.')
+    ax.axhspan(mu_pre  - sigma_pre,  mu_pre  + sigma_pre,
+               xmin=0.0, xmax=(len(pre) / len(series)),
+               color=C_PRE,  alpha=0.08,
+               label=f'Pre-break μ±σ  [{pre.index[0].date()} – {pre.index[-1].date()}]')
+    ax.axhspan(mu_post - sigma_post, mu_post + sigma_post,
+               xmin=(len(pre) / len(series)), xmax=1.0,
+               color=C_POST, alpha=0.08,
+               label=f'Post-break μ±σ  [{post.index[0].date()} – {post.index[-1].date()}]')
+    ax.hlines(mu_pre,  pre.index[0],  pre.index[-1],
+              colors=C_PRE,  linestyles='--', lw=1.0, alpha=0.70, zorder=3)
+    ax.hlines(mu_post, post.index[0], post.index[-1],
+              colors=C_POST, linestyles='--', lw=1.0, alpha=0.70, zorder=3)
+    ax.axvline(manual_break, color='black', lw=1.2, ls='-', alpha=0.85, zorder=4,
+               label=f'Manual break: {manual_break.strftime("%Y-%m-%d")}')
+    ax.annotate(
+        f'Pre-break:   μ={mu_pre:.3f},  σ={sigma_pre:.3f}\n'
+        f'Post-break:  μ={mu_post:.3f},  σ={sigma_post:.3f}\n'
+        f'Δμ = {mu_post - mu_pre:+.3f}   Δσ = {sigma_post - sigma_pre:+.3f}',
+        xy=(0.01, 0.97), xycoords='axes fraction',
+        va='top', fontsize=8,
+        bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.85),
+    )
+    ax.set_title(
+        f'Panel 1 — Regime Shift at Manual Break  '
+        f'(break at {manual_break.strftime("%Y-%m-%d")}  |  manually set — energy-crisis onset)',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.legend(fontsize=8, ncol=2, loc='upper right', framealpha=0.85)
+    ax.grid(True, alpha=0.20)
+
+    # ── Panel 2: detection comparison ─────────────────────────────────────────
+    ax = axes[1]
+    ax.plot(series.index, series.values, color=C_PRICE, lw=0.4, alpha=0.45)
+    ax.axvline(manual_break, color='black', lw=0.9, ls='--', alpha=0.50, zorder=3)
+    for mask, col, lbl in [
+        (both,        C_BOTH,      f'Both methods  (n={both.sum()})'),
+        (mb_only,     C_PRE,       f'Manual-SB only (new detections)  (n={mb_only.sum()})'),
+        (global_only, C_FULL_ONLY, f'Global-3σ only (missed by SB)  (n={global_only.sum()})'),
+    ]:
+        if mask.sum() > 0:
+            ax.scatter(series.index[mask], series.values[mask], color=col, label=lbl, **sk)
+    ax.annotate(
+        f'Both methods  : {both.sum()}\n'
+        f'Manual-SB only: {mb_only.sum()}\n'
+        f'Global-only   : {global_only.sum()}',
+        xy=(0.01, 0.97), xycoords='axes fraction',
+        va='top', fontsize=8,
+        bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.80),
+    )
+    ax.set_title(
+        'Panel 2 — Manual-SB-3σ vs Global-3σ Detection Comparison  '
+        '[purple=both  |  blue=manual-SB-only  |  red=global-only]',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.legend(fontsize=8, ncol=3, loc='upper right', framealpha=0.85)
+    ax.grid(True, alpha=0.20)
+
+    # ── Panel 3: cleaned series ───────────────────────────────────────────────
+    ax = axes[2]
+    ax.plot(replaced_mb.index, replaced_mb.values, color=C_PRICE, lw=0.5, alpha=0.85,
+            label=f'After manual-SB-3σ replacement  ({gian_manual_mask.sum()} points)')
+    ax.axvline(manual_break, color='black', lw=0.9, ls='--', alpha=0.50, zorder=3,
+               label=f'Break: {manual_break.strftime("%Y-%m-%d")}')
+    if gian_manual_mask.sum() > 0:
+        ax.scatter(series.index[gian_manual_mask], replaced_mb.values[gian_manual_mask],
+                   color=C_BOTH, marker='*', s=55, linewidths=0,
+                   zorder=5, label='Replacement position')
+    ax.set_title(
+        'Panel 3 — Cleaned Series After Manual-SB ±3σ Replacement',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.set_xlabel('Date')
+    ax.legend(fontsize=8, ncol=2, loc='upper right', framealpha=0.85)
+    ax.grid(True, alpha=0.20)
+
+    _save(fig, 'outlier_gianfreda_manual_break.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FIGURE H – Gianfreda robust ±3σ̂ (MAD) with auto-detected structural break
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_figure_H(series:          pd.Series,
+                  break_date:      pd.Timestamp,
+                  gian_rob_sb_mask: pd.Series,
+                  gian_3s_mask:    pd.Series) -> None:
+    """
+    Gianfreda ±3σ̂_robust (MAD-based) detection with the QLR-detected structural
+    break.  Shows the same 3-panel layout as Figure F but with robust thresholds.
+
+    Panel 1 – Regime shift: break date; sub-period median ± 3*σ̂_robust shaded bands
+    Panel 2 – Robust-SB-3σ̂ vs standard-global-3σ comparison
+    Panel 3 – Cleaned series after robust-SB capping
+    """
+    print("  Building Figure H – Gianfreda robust (MAD) ±3σ̂ with auto SB …")
+
+    replaced_rob_sb = _apply_gian_robust_sb_replacement(series, gian_rob_sb_mask, break_date)
+
+    # Sub-period robust statistics for annotation
+    break_pos = series.index.searchsorted(break_date)
+    vals_pre  = series.values[:break_pos]
+    vals_post = series.values[break_pos:]
+    med_pre,  sigma_rob_pre  = (np.median(vals_pre),
+                                 MAD_SCALE * np.median(np.abs(vals_pre - np.median(vals_pre))))
+    med_post, sigma_rob_post = (np.median(vals_post),
+                                 MAD_SCALE * np.median(np.abs(vals_post - np.median(vals_post))))
+    pre  = series.iloc[:break_pos]
+    post = series.iloc[break_pos:]
+
+    rob_only    = gian_rob_sb_mask & ~gian_3s_mask
+    global_only = ~gian_rob_sb_mask &  gian_3s_mask
+    both        = gian_rob_sb_mask  &  gian_3s_mask
+
+    print(f"    Break date        : {break_date.date()}")
+    print(f"    Pre-break  n={len(pre):,}  med={med_pre:.3f}  σ̂_rob={sigma_rob_pre:.3f}")
+    print(f"    Post-break n={len(post):,}  med={med_post:.3f}  σ̂_rob={sigma_rob_post:.3f}")
+    print(f"    Robust-SB-3σ̂ flagged : {gian_rob_sb_mask.sum()}  |  Global-3σ : {gian_3s_mask.sum()}")
+    print(f"    Rob-only: {rob_only.sum()}  |  global-only: {global_only.sum()}  |  both: {both.sum()}")
+
+    fig, axes = plt.subplots(
+        3, 1, figsize=(18, 18), sharex=True,
+        gridspec_kw={'hspace': 0.08, 'top': 0.960, 'bottom': 0.04,
+                     'left': 0.06, 'right': 0.98},
+    )
+    fig.suptitle(
+        f'Gianfreda Outlier Detection – Robust ±3σ̂ (MAD, 1.4826×MAD) with Structural Break\n'
+        f'Zone: {ACTIVE_ZONE}  |  {START_DATE} – {END_DATE}  |  '
+        f'Break: {break_date.strftime("%Y-%m-%d")}  (Quandt/QLR criterion)',
+        fontsize=13, fontweight='bold',
+    )
+    sk = dict(zorder=5, linewidths=0, s=12)
+    C_ROB  = '#117733'   # dark green – robust method
+    C_POST = '#E55C00'
+
+    # ── Panel 1: regime shift with robust bands ────────────────────────────────
+    ax = axes[0]
+    ax.plot(series.index, series.values, color=C_PRICE, lw=0.4, alpha=0.70,
+            label='Price_Log_Deseas.')
+    ax.axhspan(med_pre  - 3*sigma_rob_pre,  med_pre  + 3*sigma_rob_pre,
+               xmin=0.0, xmax=(len(pre) / len(series)),
+               color=C_ROB,  alpha=0.07,
+               label=f'Pre-break med±3σ̂_rob  [{pre.index[0].date()} – {pre.index[-1].date()}]')
+    ax.axhspan(med_post - 3*sigma_rob_post, med_post + 3*sigma_rob_post,
+               xmin=(len(pre) / len(series)), xmax=1.0,
+               color=C_POST, alpha=0.07,
+               label=f'Post-break med±3σ̂_rob  [{post.index[0].date()} – {post.index[-1].date()}]')
+    ax.hlines(med_pre,  pre.index[0],  pre.index[-1],
+              colors=C_ROB,  linestyles='--', lw=1.0, alpha=0.70, zorder=3)
+    ax.hlines(med_post, post.index[0], post.index[-1],
+              colors=C_POST, linestyles='--', lw=1.0, alpha=0.70, zorder=3)
+    ax.axvline(break_date, color='black', lw=1.2, ls='-', alpha=0.85, zorder=4,
+               label=f'Structural break: {break_date.strftime("%Y-%m-%d")}')
+    ax.annotate(
+        f'Pre-break:   med={med_pre:.3f},  σ̂_rob={sigma_rob_pre:.3f}\n'
+        f'Post-break:  med={med_post:.3f},  σ̂_rob={sigma_rob_post:.3f}\n'
+        f'Δmed = {med_post - med_pre:+.3f}   Δσ̂ = {sigma_rob_post - sigma_rob_pre:+.3f}',
+        xy=(0.01, 0.97), xycoords='axes fraction',
+        va='top', fontsize=8,
+        bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.85),
+    )
+    ax.set_title(
+        f'Panel 1 — Regime Shift (Robust σ̂)  '
+        f'(break at {break_date.strftime("%Y-%m-%d")}  |  bands = median ± 3*σ̂_rob per sub-period)',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.legend(fontsize=8, ncol=2, loc='upper right', framealpha=0.85)
+    ax.grid(True, alpha=0.20)
+
+    # ── Panel 2: robust-SB vs global standard comparison ─────────────────────
+    ax = axes[1]
+    ax.plot(series.index, series.values, color=C_PRICE, lw=0.4, alpha=0.45)
+    ax.axvline(break_date, color='black', lw=0.9, ls='--', alpha=0.50, zorder=3)
+    for mask, col, lbl in [
+        (both,        C_BOTH,      f'Both methods  (n={both.sum()})'),
+        (rob_only,    C_ROB,       f'Robust-SB only (new detections)  (n={rob_only.sum()})'),
+        (global_only, C_FULL_ONLY, f'Global-std only (missed by robust)  (n={global_only.sum()})'),
+    ]:
+        if mask.sum() > 0:
+            ax.scatter(series.index[mask], series.values[mask], color=col, label=lbl, **sk)
+    ax.annotate(
+        f'Both methods  : {both.sum()}\n'
+        f'Robust-SB only: {rob_only.sum()}\n'
+        f'Global-std only:{global_only.sum()}',
+        xy=(0.01, 0.97), xycoords='axes fraction',
+        va='top', fontsize=8,
+        bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.80),
+    )
+    ax.set_title(
+        'Panel 2 — Robust-SB-3σ̂ vs Standard-Global-3σ Comparison  '
+        '[purple=both  |  green=robust-only  |  red=std-only]',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.legend(fontsize=8, ncol=3, loc='upper right', framealpha=0.85)
+    ax.grid(True, alpha=0.20)
+
+    # ── Panel 3: cleaned series ───────────────────────────────────────────────
+    ax = axes[2]
+    ax.plot(replaced_rob_sb.index, replaced_rob_sb.values, color=C_PRICE, lw=0.5, alpha=0.85,
+            label=f'After robust-SB-3σ̂ replacement  ({gian_rob_sb_mask.sum()} points)')
+    ax.axvline(break_date, color='black', lw=0.9, ls='--', alpha=0.50, zorder=3,
+               label=f'Break: {break_date.strftime("%Y-%m-%d")}')
+    if gian_rob_sb_mask.sum() > 0:
+        ax.scatter(series.index[gian_rob_sb_mask], replaced_rob_sb.values[gian_rob_sb_mask],
+                   color=C_BOTH, marker='*', s=55, linewidths=0,
+                   zorder=5, label='Replacement position')
+    ax.set_title(
+        'Panel 3 — Cleaned Series After Robust-SB ±3σ̂ Replacement  (capped at median ± 3*σ̂_rob)',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.set_xlabel('Date')
+    ax.legend(fontsize=8, ncol=2, loc='upper right', framealpha=0.85)
+    ax.grid(True, alpha=0.20)
+
+    _save(fig, 'outlier_gianfreda_robust_sb.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FIGURE I – Gianfreda robust ±3σ̂ (MAD), no structural break
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_figure_I(series:          pd.Series,
+                  gian_robust_mask: pd.Series,
+                  gian_3s_mask:    pd.Series) -> None:
+    """
+    Gianfreda per-weekday ±3σ̂_robust (MAD-based) detection on the full series
+    with no structural break.
+
+    Panel 1 – Series with overall median ± 3*σ̂_robust reference lines + flagged points
+    Panel 2 – Robust ±3σ̂ vs standard ±3σ comparison (robust-only / std-only / both)
+    Panel 3 – Cleaned series after per-weekday robust ±3σ̂ capping
+    """
+    print("  Building Figure I – Gianfreda robust (MAD) ±3σ̂, no break …")
+
+    replaced_rob = _apply_gian_robust_replacement(series, gian_robust_mask)
+
+    rob_only    = gian_robust_mask & ~gian_3s_mask
+    std_only    = ~gian_robust_mask &  gian_3s_mask
+    both        = gian_robust_mask  &  gian_3s_mask
+
+    # Overall reference lines (whole-series, not per-weekday)
+    med_all     = series.median()
+    mad_all     = (series - med_all).abs().median()
+    sigma_rob_all = MAD_SCALE * mad_all
+
+    print(f"    Global median={med_all:.3f}  σ̂_rob={sigma_rob_all:.3f}  "
+          f"(cf. sample std={series.std():.3f})")
+    print(f"    Robust ±3σ̂  : {gian_robust_mask.sum():5d} flagged")
+    print(f"    Standard ±3σ : {gian_3s_mask.sum():5d} flagged")
+    print(f"    Robust-only: {rob_only.sum()}  |  std-only: {std_only.sum()}  |  both: {both.sum()}")
+
+    fig, axes = plt.subplots(
+        3, 1, figsize=(18, 18), sharex=True,
+        gridspec_kw={'hspace': 0.08, 'top': 0.960, 'bottom': 0.04,
+                     'left': 0.06, 'right': 0.98},
+    )
+    fig.suptitle(
+        f'Gianfreda Outlier Detection – Robust ±3σ̂ (MAD, 1.4826×MAD, per weekday, global)\n'
+        f'Zone: {ACTIVE_ZONE}  |  {START_DATE} – {END_DATE}  |  '
+        f'{len(series):,} hourly observations',
+        fontsize=13, fontweight='bold',
+    )
+    sk = dict(zorder=5, linewidths=0, s=12)
+    C_ROB = '#117733'
+
+    # ── Panel 1: series + reference lines + flagged points ───────────────────
+    ax = axes[0]
+    ax.plot(series.index, series.values, color=C_PRICE, lw=0.4, alpha=0.70,
+            label='Price_Log_Deseas.')
+    if gian_robust_mask.sum() > 0:
+        ax.scatter(series.index[gian_robust_mask], series.values[gian_robust_mask],
+                   color=C_ROB, label=f'Flagged ±3σ̂_rob  (n={gian_robust_mask.sum()})', **sk)
+    ax.axhline(med_all + 3.0 * sigma_rob_all, color=C_THRESHOLD, ls='--', lw=0.9, alpha=0.8,
+               label=f'+3σ̂_rob (overall) = {med_all+3*sigma_rob_all:.2f}')
+    ax.axhline(med_all - 3.0 * sigma_rob_all, color=C_THRESHOLD, ls=':', lw=0.9, alpha=0.8,
+               label=f'−3σ̂_rob (overall) = {med_all-3*sigma_rob_all:.2f}')
+    ax.set_title(
+        'Panel 1 — Full-Spectrum Outliers  [±3σ̂_robust per weekday, global thresholds]'
+        '  (overall ±3σ̂_rob lines shown for reference)',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.legend(fontsize=8, ncol=4, loc='upper right', framealpha=0.8)
+    ax.grid(True, alpha=0.20)
+
+    # ── Panel 2: robust vs standard comparison ────────────────────────────────
+    ax = axes[1]
+    ax.plot(series.index, series.values, color=C_PRICE, lw=0.4, alpha=0.45)
+    for mask, col, lbl in [
+        (both,     C_BOTH,      f'Both methods  (n={both.sum()})'),
+        (rob_only, C_ROB,       f'Robust ±3σ̂ only (new detections)  (n={rob_only.sum()})'),
+        (std_only, C_FULL_ONLY, f'Standard ±3σ only (missed by robust)  (n={std_only.sum()})'),
+    ]:
+        if mask.sum() > 0:
+            ax.scatter(series.index[mask], series.values[mask], color=col, label=lbl, **sk)
+    ax.axhline(med_all + 3.0 * sigma_rob_all, color=C_THRESHOLD, ls='--', lw=0.7, alpha=0.6,
+               label='±3σ̂_rob (overall, ref.)')
+    ax.axhline(med_all - 3.0 * sigma_rob_all, color=C_THRESHOLD, ls=':', lw=0.7, alpha=0.6)
+    ax.annotate(
+        f'Robust ±3σ̂  flagged: {gian_robust_mask.sum()}\n'
+        f'Standard ±3σ flagged: {gian_3s_mask.sum()}\n'
+        f'Robust-only : {rob_only.sum()}  |  std-only : {std_only.sum()}  |  both : {both.sum()}',
+        xy=(0.01, 0.97), xycoords='axes fraction',
+        va='top', fontsize=8,
+        bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.80),
+    )
+    ax.set_title(
+        'Panel 2 — Robust ±3σ̂ vs Standard ±3σ Comparison  '
+        '[purple=both  |  green=robust-only  |  red=std-only]',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.legend(fontsize=8, ncol=3, loc='upper right', framealpha=0.85)
+    ax.grid(True, alpha=0.20)
+
+    # ── Panel 3: cleaned series ───────────────────────────────────────────────
+    ax = axes[2]
+    ax.plot(replaced_rob.index, replaced_rob.values, color=C_GIAN, lw=0.5, alpha=0.85,
+            label=f'After robust ±3σ̂ replacement  ({gian_robust_mask.sum()} points)')
+    if gian_robust_mask.sum() > 0:
+        ax.scatter(series.index[gian_robust_mask], replaced_rob.values[gian_robust_mask],
+                   color=C_GIAN, marker='*', s=55, linewidths=0,
+                   zorder=5, label='Replacement position')
+    ax.set_title(
+        'Panel 3 — Cleaned Series After Robust ±3σ̂ Replacement  (capped at per-weekday median ± 3*σ̂_rob)',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.set_xlabel('Date')
+    ax.legend(fontsize=8, ncol=2, loc='upper right', framealpha=0.85)
+    ax.grid(True, alpha=0.20)
+
+    _save(fig, 'outlier_gianfreda_robust.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FIGURE J – Gianfreda ±4σ per weekday, regime-specific (manual break 2021-10)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_figure_J(series:             pd.Series,
+                  gian_mb4s_mask:     pd.Series,
+                  gian_mb3s_mask:     pd.Series,
+                  manual_break:       pd.Timestamp) -> None:
+    """
+    Gianfreda ±4σ detection with the manual structural break (2021-10-01).
+    Both the threshold (4σ) and the distribution parameters (μ, σ) are
+    estimated separately within each sub-period and each weekday, so the
+    detection adapts fully to each regime's own scale.
+
+    Panel 1 – Regime shift at the manual break; sub-period μ±σ shaded bands
+    Panel 2 – ±4σ vs ±3σ within-regime comparison: borderline (3σ-only within
+              each sub-period) vs confirmed (≥4σ within each sub-period)
+    Panel 3 – Cleaned series after manual-SB ±4σ per-weekday capping
+    """
+    print("  Building Figure J – Gianfreda manual break ±4σ per-regime …")
+
+    replaced_mb4 = _apply_gian4_sb_replacement(series, gian_mb4s_mask, manual_break)
+
+    pre  = series[series.index <  manual_break]
+    post = series[series.index >= manual_break]
+    mu_pre,  sigma_pre  = pre.mean(),  pre.std()
+    mu_post, sigma_post = post.mean(), post.std()
+
+    # Points flagged by per-regime 3σ but NOT by per-regime 4σ  → borderline
+    borderline = gian_mb3s_mask & ~gian_mb4s_mask
+    confirmed  = gian_mb4s_mask
+
+    print(f"    Manual break      : {manual_break.date()}")
+    print(f"    Pre-break  n={len(pre):,}  μ={mu_pre:.3f}  σ={sigma_pre:.3f}")
+    print(f"    Post-break n={len(post):,}  μ={mu_post:.3f}  σ={sigma_post:.3f}")
+    print(f"    SB-±4σ flagged : {gian_mb4s_mask.sum()}  |  SB-±3σ : {gian_mb3s_mask.sum()}")
+    print(f"    Borderline (3σ-only): {borderline.sum()}  |  Confirmed (≥4σ): {confirmed.sum()}")
+
+    fig, axes = plt.subplots(
+        3, 1, figsize=(18, 18), sharex=True,
+        gridspec_kw={'hspace': 0.08, 'top': 0.960, 'bottom': 0.04,
+                     'left': 0.06, 'right': 0.98},
+    )
+    fig.suptitle(
+        f'Gianfreda Outlier Detection – ±4σ per Weekday, Regime-Specific\n'
+        f'Zone: {ACTIVE_ZONE}  |  {START_DATE} – {END_DATE}  |  '
+        f'Manual break: {manual_break.strftime("%Y-%m-%d")}  (energy-crisis onset)',
+        fontsize=13, fontweight='bold',
+    )
+    sk = dict(zorder=5, linewidths=0, s=12)
+    C_PRE  = '#4477AA'
+    C_POST = '#E55C00'
+
+    # ── Panel 1: regime shift ──────────────────────────────────────────────────
+    ax = axes[0]
+    ax.plot(series.index, series.values, color=C_PRICE, lw=0.4, alpha=0.70,
+            label='Price_Log_Deseas.')
+    ax.axhspan(mu_pre  - sigma_pre,  mu_pre  + sigma_pre,
+               xmin=0.0, xmax=(len(pre) / len(series)),
+               color=C_PRE,  alpha=0.08,
+               label=f'Pre-break μ±σ  [{pre.index[0].date()} – {pre.index[-1].date()}]')
+    ax.axhspan(mu_post - sigma_post, mu_post + sigma_post,
+               xmin=(len(pre) / len(series)), xmax=1.0,
+               color=C_POST, alpha=0.08,
+               label=f'Post-break μ±σ  [{post.index[0].date()} – {post.index[-1].date()}]')
+    ax.hlines(mu_pre,  pre.index[0],  pre.index[-1],
+              colors=C_PRE,  linestyles='--', lw=1.0, alpha=0.70, zorder=3)
+    ax.hlines(mu_post, post.index[0], post.index[-1],
+              colors=C_POST, linestyles='--', lw=1.0, alpha=0.70, zorder=3)
+    ax.axvline(manual_break, color='black', lw=1.2, ls='-', alpha=0.85, zorder=4,
+               label=f'Manual break: {manual_break.strftime("%Y-%m-%d")}')
+    ax.annotate(
+        f'Pre-break:   μ={mu_pre:.3f},  σ={sigma_pre:.3f}\n'
+        f'Post-break:  μ={mu_post:.3f},  σ={sigma_post:.3f}\n'
+        f'Δμ = {mu_post - mu_pre:+.3f}   Δσ = {sigma_post - sigma_pre:+.3f}',
+        xy=(0.01, 0.97), xycoords='axes fraction',
+        va='top', fontsize=8,
+        bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.85),
+    )
+    ax.set_title(
+        f'Panel 1 — Regime Shift at Manual Break  '
+        f'(break at {manual_break.strftime("%Y-%m-%d")}  |  thresholds: ±4σ per weekday per regime)',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.legend(fontsize=8, ncol=2, loc='upper right', framealpha=0.85)
+    ax.grid(True, alpha=0.20)
+
+    # ── Panel 2: per-regime 3σ vs 4σ comparison ───────────────────────────────
+    ax = axes[1]
+    ax.plot(series.index, series.values, color=C_PRICE, lw=0.4, alpha=0.45)
+    ax.axvline(manual_break, color='black', lw=0.9, ls='--', alpha=0.50, zorder=3)
+    for mask, col, lbl in [
+        (borderline, C_FRED,      f'Borderline: per-regime 3σ-only  (n={borderline.sum()})'),
+        (confirmed,  C_FULL_ONLY, f'Confirmed: per-regime ≥4σ  (n={confirmed.sum()})'),
+    ]:
+        if mask.sum() > 0:
+            ax.scatter(series.index[mask], series.values[mask], color=col, label=lbl, **sk)
+    ax.annotate(
+        f'Per-regime ±3σ flagged : {gian_mb3s_mask.sum()}\n'
+        f'Per-regime ±4σ flagged : {gian_mb4s_mask.sum()}\n'
+        f'Borderline (3σ < |x| ≤ 4σ) : {borderline.sum()}\n'
+        f'Confirmed  (|x| > 4σ)       : {confirmed.sum()}',
+        xy=(0.01, 0.97), xycoords='axes fraction',
+        va='top', fontsize=8,
+        bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.80),
+    )
+    ax.set_title(
+        'Panel 2 — Per-Regime ±3σ vs ±4σ Comparison  '
+        '[orange = borderline (between 3σ–4σ within regime)  |  red = confirmed (beyond 4σ within regime)]',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.legend(fontsize=8, ncol=3, loc='upper right', framealpha=0.85)
+    ax.grid(True, alpha=0.20)
+
+    # ── Panel 3: cleaned series ───────────────────────────────────────────────
+    ax = axes[2]
+    ax.plot(replaced_mb4.index, replaced_mb4.values, color=C_PRICE, lw=0.5, alpha=0.85,
+            label=f'After manual-SB ±4σ replacement  ({gian_mb4s_mask.sum()} points)')
+    ax.axvline(manual_break, color='black', lw=0.9, ls='--', alpha=0.50, zorder=3,
+               label=f'Break: {manual_break.strftime("%Y-%m-%d")}')
+    if gian_mb4s_mask.sum() > 0:
+        ax.scatter(series.index[gian_mb4s_mask], replaced_mb4.values[gian_mb4s_mask],
+                   color=C_BOTH, marker='*', s=55, linewidths=0,
+                   zorder=5, label='Replacement position')
+    ax.set_title(
+        'Panel 3 — Cleaned Series After Manual-SB ±4σ Replacement  (capped at per-weekday ±4σ within each regime)',
+        fontsize=10, fontweight='bold', loc='left', pad=4,
+    )
+    ax.set_ylabel('Deseas. Log Price')
+    ax.set_xlabel('Date')
+    ax.legend(fontsize=8, ncol=2, loc='upper right', framealpha=0.85)
+    ax.grid(True, alpha=0.20)
+
+    _save(fig, 'outlier_gianfreda_manual_break_4sigma.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FIGURE K – All Gianfreda cleaned series: 6-panel summary comparison
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_figure_K(series:           pd.Series,
+                  gian_3s_mask:     pd.Series,
+                  gian_mb3s_mask:   pd.Series,
+                  gian_sb3s_mask:   pd.Series,
+                  gian_4s_mask:     pd.Series,
+                  gian_mb4s_mask:   pd.Series,
+                  gian_qlr4s_mask:  pd.Series,
+                  manual_break:     pd.Timestamp,
+                  qlr_break:        pd.Timestamp) -> None:
+    """
+    6-panel summary figure comparing every Gianfreda cleaning variant.
+    Each panel shows only the post-replacement series with ★ replacement markers.
+    Annotation boxes report total replacements plus pre/post-break counts:
+      – No-break methods : total only
+      – Manual-break methods : pre / post 2021-10-01
+      – QLR-break methods    : pre / post QLR date
+    """
+    print("  Building Figure K – Gianfreda all-variants comparison …")
+
+    # ── Compute all six cleaned series ───────────────────────────────────────
+    rep_3s     = _apply_gian_replacement(series, gian_3s_mask)
+    rep_mb3s   = _apply_gian_sb_replacement(series, gian_mb3s_mask,  manual_break)
+    rep_sb3s   = _apply_gian_sb_replacement(series, gian_sb3s_mask,  qlr_break)
+    rep_4s     = _apply_gian4_replacement(series, gian_4s_mask)
+    rep_mb4s   = _apply_gian4_sb_replacement(series, gian_mb4s_mask, manual_break)
+    rep_qlr4s  = _apply_gian4_sb_replacement(series, gian_qlr4s_mask, qlr_break)
+
+    # ── Helper: build annotation string ──────────────────────────────────────
+    def _ann(mask, break_date=None):
+        total = int(mask.sum())
+        if break_date is None:
+            return f'Replaced: {total}'
+        bp   = series.index.searchsorted(break_date)
+        pre  = int(mask.values[:bp].sum())
+        post = int(mask.values[bp:].sum())
+        return (f'Replaced: {total} total\n'
+                f'Pre-{break_date.strftime("%Y-%m-%d")}: {pre}  |  '
+                f'Post: {post}')
+
+    # Print summary to console
+    for lbl, mask, bd in [
+        ('3σ global',      gian_3s_mask,    None),
+        ('3σ manual break',gian_mb3s_mask,  manual_break),
+        ('3σ QLR break',   gian_sb3s_mask,  qlr_break),
+        ('4σ global',      gian_4s_mask,    None),
+        ('4σ manual break',gian_mb4s_mask,  manual_break),
+        ('4σ QLR break',   gian_qlr4s_mask, qlr_break),
+    ]:
+        print(f'    {lbl:<22s}: {_ann(mask, bd).replace(chr(10), "  ")}')
+
+    # ── Colour palette (Okabe-Ito, colour-blind friendly) ────────────────────
+    C_3S_GLOB = '#009E73'   # teal
+    C_3S_MB   = '#0072B2'   # blue
+    C_3S_QLR  = '#56B4E9'   # sky blue
+    C_4S_GLOB = '#E69F00'   # amber
+    C_4S_MB   = '#D55E00'   # vermillion
+    C_4S_QLR  = '#CC79A7'   # pink/mauve
+
+    variants = [
+        # (panel label,            replaced,    mask,           break_date,   colour)
+        ('3σ  –  global (no break)',
+             rep_3s,    gian_3s_mask,    None,         C_3S_GLOB),
+        (f'3σ  –  manual break  [{manual_break.strftime("%Y-%m-%d")}]',
+             rep_mb3s,  gian_mb3s_mask,  manual_break, C_3S_MB),
+        (f'3σ  –  QLR break  [{qlr_break.strftime("%Y-%m-%d")}]',
+             rep_sb3s,  gian_sb3s_mask,  qlr_break,    C_3S_QLR),
+        ('4σ  –  global (no break)',
+             rep_4s,    gian_4s_mask,    None,         C_4S_GLOB),
+        (f'4σ  –  manual break  [{manual_break.strftime("%Y-%m-%d")}]',
+             rep_mb4s,  gian_mb4s_mask,  manual_break, C_4S_MB),
+        (f'4σ  –  QLR break  [{qlr_break.strftime("%Y-%m-%d")}]',
+             rep_qlr4s, gian_qlr4s_mask, qlr_break,    C_4S_QLR),
+    ]
+
+    fig, axes = plt.subplots(
+        6, 1, figsize=(18, 36), sharex=True,
+        gridspec_kw={'hspace': 0.07, 'top': 0.970, 'bottom': 0.025,
+                     'left': 0.06, 'right': 0.98},
+    )
+    fig.suptitle(
+        f'Gianfreda Outlier Removal – All Variants Compared\n'
+        f'Zone: {ACTIVE_ZONE}  |  {START_DATE} – {END_DATE}  |  '
+        f'{len(series):,} hourly observations',
+        fontsize=13, fontweight='bold',
+    )
+
+    for ax, (panel_lbl, replaced, mask, bd, col) in zip(axes, variants):
+        # Cleaned series line
+        ax.plot(replaced.index, replaced.values,
+                color=col, lw=0.5, alpha=0.85,
+                label=f'Cleaned  ({mask.sum()} replaced)')
+
+        # Replacement position markers
+        if mask.sum() > 0:
+            ax.scatter(series.index[mask], replaced.values[mask],
+                       color=col, marker='*', s=45, linewidths=0, zorder=5,
+                       label='Replacement position')
+
+        # Break date vertical line (where applicable)
+        if bd is not None:
+            ax.axvline(bd, color='black', lw=0.9, ls='--', alpha=0.55, zorder=4,
+                       label=f'Break: {bd.strftime("%Y-%m-%d")}')
+
+        # Annotation box with counts
+        ax.annotate(
+            _ann(mask, bd),
+            xy=(0.01, 0.97), xycoords='axes fraction',
+            va='top', fontsize=8,
+            bbox=dict(boxstyle='round,pad=0.3', fc='white', alpha=0.85),
+        )
+
+        ax.set_title(
+            f'Panel {variants.index((panel_lbl, replaced, mask, bd, col)) + 1} — '
+            f'Gianfreda {panel_lbl}',
+            fontsize=10, fontweight='bold', loc='left', pad=4,
+        )
+        ax.set_ylabel('Deseas. Log Price')
+        ax.legend(fontsize=8, ncol=3, loc='upper right', framealpha=0.85)
+        ax.grid(True, alpha=0.20)
+
+    axes[-1].set_xlabel('Date')
+
+    _save(fig, 'outlier_gianfreda_all_variants.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  FIGURE C – cross-method comparison (Fredriksson vs. Gianfreda)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1108,6 +1989,7 @@ def _save(fig, filename: str) -> None:
     path = os.path.join(OUTPUT_DIR, filename)
     fig.savefig(path, dpi=150, bbox_inches='tight')
     plt.close(fig)
+    gc.collect()
     print(f"    Saved → {path}")
 
 
@@ -1171,6 +2053,22 @@ if __name__ == '__main__':
     gian_counts       = rolling_outlier_counts(series, 'gianfreda')
     gian_rolling_mask = gian_counts['flagged'] > 0
 
+    MANUAL_BREAK = pd.Timestamp('2021-10-01')
+    print(f"  Manual break (2021-10-01) – Gianfreda ±3σ …")
+    gian_manual_mask = detect_gianfreda_structural_break(series, MANUAL_BREAK)
+
+    print(f"  Manual break (2021-10-01) – Gianfreda ±4σ per regime …")
+    gian_manual_4s_mask = detect_gianfreda_4sigma_structural_break(series, MANUAL_BREAK)
+
+    print(f"  QLR break – Gianfreda ±4σ per regime …")
+    gian_qlr_4s_mask = detect_gianfreda_4sigma_structural_break(series, break_date)
+
+    print("  Full-spectrum – Gianfreda robust ±3σ̂ (MAD, no break) …")
+    gian_robust_mask = detect_gianfreda_robust(series)
+
+    print("  Full-spectrum – Gianfreda robust ±3σ̂ (MAD, SB-aware) …")
+    gian_rob_sb_mask = detect_gianfreda_robust_structural_break(series, break_date)
+
     # (replacements are computed inside make_figure_B/D from the pre-detected masks)
 
     # ── 3. Generate all figures ───────────────────────────────────────────────
@@ -1198,8 +2096,26 @@ if __name__ == '__main__':
     # Figure E: Gianfreda ±4σ relaxed threshold
     make_figure_E(series, gian_full_mask, gian_4s_mask)
 
-    # Figure F: Gianfreda ±3σ structural-break-aware
+    # Figure F: Gianfreda ±3σ structural-break-aware (QLR auto-detected break)
     make_figure_F(series, break_date, gian_sb_mask, gian_full_mask)
+
+    # Figure G: Gianfreda ±3σ with manually set break (2021-10-01)
+    make_figure_G(series, gian_manual_mask, gian_full_mask, MANUAL_BREAK)
+
+    # Figure H: Gianfreda robust ±3σ̂ (MAD) + QLR structural break
+    make_figure_H(series, break_date, gian_rob_sb_mask, gian_full_mask)
+
+    # Figure I: Gianfreda robust ±3σ̂ (MAD), no structural break
+    make_figure_I(series, gian_robust_mask, gian_full_mask)
+
+    # Figure J: Gianfreda ±4σ per weekday, regime-specific (manual break 2021-10)
+    make_figure_J(series, gian_manual_4s_mask, gian_manual_mask, MANUAL_BREAK)
+
+    # Figure K: all Gianfreda variants combined (6-panel summary)
+    make_figure_K(series,
+                  gian_full_mask,     gian_manual_mask,    gian_sb_mask,
+                  gian_4s_mask,       gian_manual_4s_mask, gian_qlr_4s_mask,
+                  MANUAL_BREAK,       break_date)
 
     print(f"\nDone. All figures saved to:  {OUTPUT_DIR}/")
     print("  outlier_comparison_fredriksson.png")
@@ -1209,3 +2125,8 @@ if __name__ == '__main__':
     print("  outlier_cross_method.png")
     print("  outlier_gianfreda_4sigma.png")
     print("  outlier_gianfreda_structural_break.png")
+    print("  outlier_gianfreda_manual_break.png")
+    print("  outlier_gianfreda_robust_sb.png")
+    print("  outlier_gianfreda_robust.png")
+    print("  outlier_gianfreda_manual_break_4sigma.png")
+    print("  outlier_gianfreda_all_variants.png")
