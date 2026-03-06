@@ -3,10 +3,18 @@ descriptive_overview.py  –  Descriptive Overview: Swedish Electricity Market
 ═══════════════════════════════════════════════════════════════════════════════
 
 Produces:
-  1. price_series_raw.png         –  SE1–SE4 spot prices (EUR/MWh), 2015–2025
-  2. price_series_log.png         –  SE1–SE4 ln(price), 2015–2025 [positive only]
-  3. cross_border_flows_2025.tex  –  LaTeX table: net exchange by zone, 2025
-  4. production_mix_2025.tex      –  LaTeX table: wind / other / consumption, 2025
+  1.  price_series_raw.png         –  SE1–SE4 daily avg spot prices (EUR/MWh), 2015–2025
+  2.  price_series_log.png         –  SE1–SE4 ln(price + shift) daily avg, 2015–2025
+                                      shift = |global_min_daily| + 1 (ensures all args > 0)
+  3.  volatility_raw.png           –  SE1–SE4 daily price volatility (intra-day std), 2015–2025
+  4.  volatility_log.png           –  SE1–SE4 daily volatility of ln(price + shift), 2015–2025
+                                      shift = |global_min_hourly| + 1
+  5.  monthly_price_raw.png        –  SE1–SE4 monthly average of daily VWAP (EUR/MWh)
+  6.  monthly_price_log.png        –  SE1–SE4 monthly average of ln(VWAP + shift)
+  7.  monthly_volatility_raw.png   –  SE1–SE4 monthly average of daily intra-day std
+  8.  monthly_volatility_log.png   –  SE1–SE4 monthly average of daily std of ln(price + shift)
+  9.  cross_border_flows_2025.tex  –  LaTeX table: net exchange by zone, 2025
+  10. production_mix_2025.tex      –  LaTeX table: wind / other / consumption, 2025
 
 Data limitations:
   · Only aggregate Net_Exchange (MW, hourly) is available per zone. Bilateral
@@ -88,21 +96,59 @@ def _save_tex(content, name):
 #  1.  PRICE SERIES PLOTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def plot_price_series():
-    print("\n[1/3]  Price series plots …")
-
+def _load_hourly_prices():
+    """Return hourly price DataFrame indexed by Timestamp, columns = ZONES."""
     df = pd.read_excel(PATHS['prices'])
     df['Timestamp'] = pd.to_datetime(df['Timestamp'])
     df = df.set_index('Timestamp')
-
-    # Rename 'SE*_Price (EUR)' → 'SE*'
     df = df.rename(columns={f'SE{i}_Price (EUR)': f'SE{i}' for i in range(1, 5)})
-    df = df[ZONES]
+    return df[ZONES]
 
-    # Daily averages make ~96 k hourly points readable
-    daily = df.resample('D').mean()
 
-    # ── Figure A: raw prices ─────────────────────────────────────────────────
+def _load_hourly_consumption():
+    """Return hourly Consumption_Forecast (MW) per zone, indexed by Timestamp."""
+    frames = {}
+    for zone in ZONES:
+        z = pd.read_excel(PATHS[zone])
+        z['Timestamp'] = pd.to_datetime(z['Timestamp'])
+        z = z.set_index('Timestamp')
+        frames[zone] = z['Consumption_Forecast']
+    return pd.DataFrame(frames)
+
+
+def _daily_vwap(price_df, cons_df):
+    """
+    Volume-weighted average price per day per zone.
+
+    VWAP_d = Σ_h (price_h × consumption_h) / Σ_h consumption_h
+
+    Consumption_Forecast (MW) serves as the hourly trading volume proxy
+    (MW × 1 h = MWh of energy cleared at the spot price in that hour).
+    """
+    daily = pd.DataFrame(index=pd.date_range(
+        price_df.index.min().date(), price_df.index.max().date(), freq='D'
+    ))
+    for zone in ZONES:
+        p = price_df[zone]
+        w = cons_df[zone].clip(lower=0)          # weight must be non-negative
+        num = (p * w).resample('D').sum()
+        den = w.resample('D').sum().replace(0, np.nan)
+        daily[zone] = num / den
+    return daily
+
+
+def plot_price_series():
+    print("\n[1/3]  Price series plots …")
+
+    price_df = _load_hourly_prices()
+    cons_df  = _load_hourly_consumption()
+
+    # ── Volume-weighted daily average prices (VWAP) ───────────────────────────
+    daily = _daily_vwap(price_df, cons_df)
+    print(f"    VWAP computed: {daily.shape[0]} days, "
+          f"global min = {daily.min().min():.2f} EUR/MWh")
+
+    # ── Figure A: raw VWAP ───────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(14, 5))
     for zone in ZONES:
         ax.plot(daily.index, daily[zone],
@@ -110,7 +156,8 @@ def plot_price_series():
     ax.axhline(0, color='#555555', lw=0.7, ls='--', alpha=0.45,
                label='Price = 0')
     ax.set_title(
-        'Swedish Electricity Spot Prices – SE1 to SE4 (Daily Average), 2015–2025',
+        'Swedish Electricity Spot Prices – SE1 to SE4\n'
+        'Volume-Weighted Daily Average (Consumption-Weighted VWAP), 2015–2025',
         fontsize=12, fontweight='bold',
     )
     ax.set_xlabel('Date', fontsize=10)
@@ -120,34 +167,160 @@ def plot_price_series():
     fig.tight_layout()
     _save_fig(fig, 'price_series_raw.png')
 
-    # ── Figure B: natural-log prices ─────────────────────────────────────────
-    # Non-positive daily averages set to NaN (not plotted); noted in title.
-    log_daily = pd.DataFrame(index=daily.index)
-    for zone in ZONES:
-        col = daily[zone]
-        log_daily[zone] = np.where(col > 0, np.log(col), np.nan)
+    # ── Log transformation: shift all VWAP values so minimum → 1 ────────────
+    # shift = −min(VWAP_global) + 1  ⟹  ln(VWAP + shift) ≥ ln(1) = 0 always
+    global_min_daily = daily[ZONES].min().min()
+    shift_d = -global_min_daily + 1
+    log_daily = np.log(daily[ZONES] + shift_d)
+    print(f"    Daily VWAP shift = {shift_d:.4f}  "
+          f"(global_min = {global_min_daily:.4f})")
 
-    neg_counts = {z: int((daily[z] <= 0).sum()) for z in ZONES}
-    neg_note = '  |  '.join(
-        f'{z}: {n} days ≤ 0 omitted' for z, n in neg_counts.items() if n > 0
-    )
-
+    # ── Figure B: ln(VWAP + shift) ───────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(14, 5))
     for zone in ZONES:
         ax.plot(log_daily.index, log_daily[zone],
                 color=ZONE_COLORS[zone], lw=0.9, alpha=0.85, label=zone)
     ax.set_title(
-        'Swedish Electricity Spot Prices – Natural Log Transformation (Daily Average), 2015–2025\n'
-        + (f'Non-positive observations omitted: {neg_note}' if neg_note
-           else 'All daily averages positive'),
+        f'Swedish Electricity Spot Prices – ln(VWAP + {shift_d:.2f}) (Daily), 2015–2025\n'
+        f'Shift = −min(VWAP) + 1 = {shift_d:.4f} EUR/MWh  |  '
+        f'min(VWAP) = {global_min_daily:.4f} EUR/MWh',
         fontsize=11, fontweight='bold',
     )
     ax.set_xlabel('Date', fontsize=10)
-    ax.set_ylabel('ln(Price)  [EUR/MWh]', fontsize=10)
+    ax.set_ylabel(f'ln(VWAP + {shift_d:.2f})  [EUR/MWh]', fontsize=10)
     ax.legend(fontsize=10, ncol=4, loc='upper left', framealpha=0.85)
     ax.grid(True, alpha=0.22)
     fig.tight_layout()
     _save_fig(fig, 'price_series_log.png')
+
+    # ── Daily volatility: intra-day std of hourly prices ─────────────────────
+    daily_std = price_df[ZONES].resample('D').std()
+
+    # ── Figure C: raw daily volatility ───────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(14, 5))
+    for zone in ZONES:
+        ax.plot(daily_std.index, daily_std[zone],
+                color=ZONE_COLORS[zone], lw=0.9, alpha=0.85, label=zone)
+    ax.set_title(
+        'Swedish Electricity Price Volatility – SE1 to SE4\n'
+        'Daily Intra-Day Standard Deviation of Hourly Spot Prices, 2015–2025',
+        fontsize=12, fontweight='bold',
+    )
+    ax.set_xlabel('Date', fontsize=10)
+    ax.set_ylabel('Price Std Dev (EUR/MWh)', fontsize=10)
+    ax.legend(fontsize=10, ncol=4, loc='upper left', framealpha=0.85)
+    ax.grid(True, alpha=0.22)
+    fig.tight_layout()
+    _save_fig(fig, 'volatility_raw.png')
+
+    # ── Log-transform hourly prices, then compute daily std ──────────────────
+    # Same shift principle applied to raw hourly prices for consistency
+    global_min_hourly = price_df[ZONES].min().min()
+    shift_h = -global_min_hourly + 1
+    log_price_df = np.log(price_df[ZONES] + shift_h)
+    daily_log_std = log_price_df.resample('D').std()
+    print(f"    Hourly price shift = {shift_h:.4f}  "
+          f"(global_min = {global_min_hourly:.4f})")
+
+    # ── Figure D: log daily volatility ───────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(14, 5))
+    for zone in ZONES:
+        ax.plot(daily_log_std.index, daily_log_std[zone],
+                color=ZONE_COLORS[zone], lw=0.9, alpha=0.85, label=zone)
+    ax.set_title(
+        f'Swedish Electricity Price Volatility – SE1 to SE4\n'
+        f'Daily Std Dev of ln(Price + {shift_h:.2f}), 2015–2025  |  '
+        f'Shift = {shift_h:.4f} EUR/MWh',
+        fontsize=11, fontweight='bold',
+    )
+    ax.set_xlabel('Date', fontsize=10)
+    ax.set_ylabel(f'Std Dev of ln(Price + {shift_h:.2f})', fontsize=10)
+    ax.legend(fontsize=10, ncol=4, loc='upper left', framealpha=0.85)
+    ax.grid(True, alpha=0.22)
+    fig.tight_layout()
+    _save_fig(fig, 'volatility_log.png')
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Monthly averages  –  Figures E–H  (all zones per graph)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── Figure E: monthly average raw VWAP (price level) ─────────────────────
+    monthly_raw = daily[ZONES].resample('ME').mean()
+    fig, ax = plt.subplots(figsize=(14, 5))
+    for zone in ZONES:
+        ax.plot(monthly_raw.index, monthly_raw[zone],
+                color=ZONE_COLORS[zone], lw=1.5, marker='o', ms=3.5,
+                alpha=0.9, label=zone)
+    ax.axhline(0, color='#555555', lw=0.7, ls='--', alpha=0.45,
+               label='Price = 0')
+    ax.set_title(
+        'Swedish Electricity Spot Prices – SE1 to SE4\n'
+        'Monthly Average of Daily VWAP (EUR/MWh), 2015–2025',
+        fontsize=12, fontweight='bold',
+    )
+    ax.set_xlabel('Date', fontsize=10)
+    ax.set_ylabel('Price (EUR/MWh)', fontsize=10)
+    ax.legend(fontsize=10, ncol=5, loc='upper left', framealpha=0.85)
+    ax.grid(True, alpha=0.22)
+    fig.tight_layout()
+    _save_fig(fig, 'monthly_price_raw.png')
+
+    # ── Figure F: monthly average log VWAP ───────────────────────────────────
+    monthly_log = log_daily[ZONES].resample('ME').mean()
+    fig, ax = plt.subplots(figsize=(14, 5))
+    for zone in ZONES:
+        ax.plot(monthly_log.index, monthly_log[zone],
+                color=ZONE_COLORS[zone], lw=1.5, marker='o', ms=3.5,
+                alpha=0.9, label=zone)
+    ax.set_title(
+        f'Swedish Electricity Spot Prices – ln(VWAP + {shift_d:.2f}) – SE1 to SE4\n'
+        f'Monthly Average, 2015–2025  |  Shift = {shift_d:.4f} EUR/MWh',
+        fontsize=11, fontweight='bold',
+    )
+    ax.set_xlabel('Date', fontsize=10)
+    ax.set_ylabel(f'ln(VWAP + {shift_d:.2f})  [EUR/MWh]', fontsize=10)
+    ax.legend(fontsize=10, ncol=4, loc='upper left', framealpha=0.85)
+    ax.grid(True, alpha=0.22)
+    fig.tight_layout()
+    _save_fig(fig, 'monthly_price_log.png')
+
+    # ── Figure G: monthly average raw volatility ──────────────────────────────
+    monthly_vol_raw = daily_std[ZONES].resample('ME').mean()
+    fig, ax = plt.subplots(figsize=(14, 5))
+    for zone in ZONES:
+        ax.plot(monthly_vol_raw.index, monthly_vol_raw[zone],
+                color=ZONE_COLORS[zone], lw=1.5, marker='o', ms=3.5,
+                alpha=0.9, label=zone)
+    ax.set_title(
+        'Swedish Electricity Price Volatility – SE1 to SE4\n'
+        'Monthly Average of Daily Intra-Day Std Dev (EUR/MWh), 2015–2025',
+        fontsize=12, fontweight='bold',
+    )
+    ax.set_xlabel('Date', fontsize=10)
+    ax.set_ylabel('Mean Daily Std Dev (EUR/MWh)', fontsize=10)
+    ax.legend(fontsize=10, ncol=4, loc='upper left', framealpha=0.85)
+    ax.grid(True, alpha=0.22)
+    fig.tight_layout()
+    _save_fig(fig, 'monthly_volatility_raw.png')
+
+    # ── Figure H: monthly average log volatility ──────────────────────────────
+    monthly_vol_log = daily_log_std[ZONES].resample('ME').mean()
+    fig, ax = plt.subplots(figsize=(14, 5))
+    for zone in ZONES:
+        ax.plot(monthly_vol_log.index, monthly_vol_log[zone],
+                color=ZONE_COLORS[zone], lw=1.5, marker='o', ms=3.5,
+                alpha=0.9, label=zone)
+    ax.set_title(
+        f'Swedish Electricity Price Volatility – SE1 to SE4\n'
+        f'Monthly Average of Daily Std Dev of ln(Price + {shift_h:.2f}), 2015–2025',
+        fontsize=11, fontweight='bold',
+    )
+    ax.set_xlabel('Date', fontsize=10)
+    ax.set_ylabel(f'Mean Std Dev of ln(Price + {shift_h:.2f})', fontsize=10)
+    ax.legend(fontsize=10, ncol=4, loc='upper left', framealpha=0.85)
+    ax.grid(True, alpha=0.22)
+    fig.tight_layout()
+    _save_fig(fig, 'monthly_volatility_log.png')
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -392,8 +565,14 @@ if __name__ == '__main__':
 
     print("\n" + "=" * 72)
     print(f"  Done.  Outputs saved to: {OUTPUT_DIR}/")
-    print("    price_series_raw.png")
-    print("    price_series_log.png")
+    print("    price_series_raw.png          (VWAP daily avg, raw)")
+    print("    price_series_log.png          (VWAP daily avg, ln-transformed)")
+    print("    volatility_raw.png            (daily intra-day std, raw)")
+    print("    volatility_log.png            (daily std of ln-prices)")
+    print("    monthly_price_raw.png         (monthly avg of daily VWAP)")
+    print("    monthly_price_log.png         (monthly avg of ln(VWAP + shift))")
+    print("    monthly_volatility_raw.png    (monthly avg of daily std, raw)")
+    print("    monthly_volatility_log.png    (monthly avg of daily std of ln-prices)")
     print("    cross_border_flows_2025.tex")
     print("    production_mix_2025.tex")
     print("=" * 72)
