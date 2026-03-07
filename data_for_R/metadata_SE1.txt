@@ -6,8 +6,8 @@ Configuration:
   Zone: SE1
   Log transform: True
   Deseasonalized: True
-  Outlier handling: True (fredriksson)
-  Negative price handling: clip
+  Outlier handling: True (gianfreda)
+  Negative price handling: shift
   Interpolation: True
 
 Regression specification for R:
