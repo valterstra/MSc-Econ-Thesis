@@ -235,14 +235,7 @@ def make_figure_zone(zone:        str,
         1, 1, figsize=(18, 8),
         gridspec_kw={'top': 0.88, 'bottom': 0.09, 'left': 0.055, 'right': 0.98},
     )
-    fig.suptitle(
-        f'Gianfreda (2010) — ±{n_sigma}σ per Weekday, '
-        f'Manual Break {break_date.strftime("%Y-%m-%d")} (energy-crisis onset)  |  Zone {zone}\n'
-        f'{START_DATE} – {END_DATE}  |  {n_total:,} hourly observations',
-        fontsize=12, fontweight='bold',
-    )
-
-    # 1. Base series
+       # 1. Base series
     ax.plot(series.index, series.values,
             color=C_PRICE, lw=0.4, alpha=0.70,
             label='Price_Log_Deseas.', zorder=2)

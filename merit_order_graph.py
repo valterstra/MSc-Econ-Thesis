@@ -221,11 +221,6 @@ def main():
     ax.set_ylim(-14, 105)
     ax.set_xlabel('Installed Capacity (GW)', fontsize=11)
     ax.set_ylabel('Marginal Cost (EUR/MWh)', fontsize=11)
-    ax.set_title(
-        'Merit Order Curve – Swedish Electricity Market\n'
-        'Illustrative Supply Stack Ordered by Marginal Cost',
-        fontsize=13, fontweight='bold',
-    )
     ax.grid(True, alpha=0.22, axis='y', zorder=0)
     ax.set_axisbelow(True)
     ax.spines['top'].set_visible(False)
@@ -240,13 +235,7 @@ def main():
     ax.set_xticklabels([f'{t:.1f}' for t in tick_positions], fontsize=8.5, rotation=35)
 
     # ── 10. Source note ───────────────────────────────────────────────────────
-    fig.text(
-        0.12, 0.01,
-        'Note: Illustrative figure. Capacity and marginal cost values are directionally correct '
-        'approximations based on Swedish Energy Agency data and Nord Pool/ENTSO-E estimates. '
-        'Demand set to 24 GW (~high-demand winter hour). Not derived from the primary dataset.',
-        fontsize=7.5, color='#666666', style='italic',
-    )
+   
 
     fig.tight_layout(rect=[0, 0.05, 1, 1])
 

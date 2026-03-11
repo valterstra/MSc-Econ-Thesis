@@ -155,11 +155,7 @@ def plot_price_series():
                 color=ZONE_COLORS[zone], lw=0.9, alpha=0.85, label=zone)
     ax.axhline(0, color='#555555', lw=0.7, ls='--', alpha=0.45,
                label='Price = 0')
-    ax.set_title(
-        'Swedish Electricity Spot Prices – SE1 to SE4\n'
-        'Volume-Weighted Daily Average (Consumption-Weighted VWAP), 2015–2025',
-        fontsize=12, fontweight='bold',
-    )
+    
     ax.set_xlabel('Date', fontsize=10)
     ax.set_ylabel('Price (EUR/MWh)', fontsize=10)
     ax.legend(fontsize=10, ncol=5, loc='upper left', framealpha=0.85)
@@ -180,12 +176,7 @@ def plot_price_series():
     for zone in ZONES:
         ax.plot(log_daily.index, log_daily[zone],
                 color=ZONE_COLORS[zone], lw=0.9, alpha=0.85, label=zone)
-    ax.set_title(
-        f'Swedish Electricity Spot Prices – ln(VWAP + {shift_d:.2f}) (Daily), 2015–2025\n'
-        f'Shift = −min(VWAP) + 1 = {shift_d:.4f} EUR/MWh  |  '
-        f'min(VWAP) = {global_min_daily:.4f} EUR/MWh',
-        fontsize=11, fontweight='bold',
-    )
+
     ax.set_xlabel('Date', fontsize=10)
     ax.set_ylabel(f'ln(VWAP + {shift_d:.2f})  [EUR/MWh]', fontsize=10)
     ax.legend(fontsize=10, ncol=4, loc='upper left', framealpha=0.85)
@@ -203,7 +194,7 @@ def plot_price_series():
                 color=ZONE_COLORS[zone], lw=0.9, alpha=0.85, label=zone)
     ax.set_title(
         'Swedish Electricity Price Volatility – SE1 to SE4\n'
-        'Daily Intra-Day Standard Deviation of Hourly Spot Prices, 2015–2025',
+        'c',
         fontsize=12, fontweight='bold',
     )
     ax.set_xlabel('Date', fontsize=10)
@@ -227,12 +218,7 @@ def plot_price_series():
     for zone in ZONES:
         ax.plot(daily_log_std.index, daily_log_std[zone],
                 color=ZONE_COLORS[zone], lw=0.9, alpha=0.85, label=zone)
-    ax.set_title(
-        f'Swedish Electricity Price Volatility – SE1 to SE4\n'
-        f'Daily Std Dev of ln(Price + {shift_h:.2f}), 2015–2025  |  '
-        f'Shift = {shift_h:.4f} EUR/MWh',
-        fontsize=11, fontweight='bold',
-    )
+    
     ax.set_xlabel('Date', fontsize=10)
     ax.set_ylabel(f'Std Dev of ln(Price + {shift_h:.2f})', fontsize=10)
     ax.legend(fontsize=10, ncol=4, loc='upper left', framealpha=0.85)
@@ -253,11 +239,7 @@ def plot_price_series():
                 alpha=0.9, label=zone)
     ax.axhline(0, color='#555555', lw=0.7, ls='--', alpha=0.45,
                label='Price = 0')
-    ax.set_title(
-        'Swedish Electricity Spot Prices – SE1 to SE4\n'
-        'Monthly Average of Daily VWAP (EUR/MWh), 2015–2025',
-        fontsize=12, fontweight='bold',
-    )
+    
     ax.set_xlabel('Date', fontsize=10)
     ax.set_ylabel('Price (EUR/MWh)', fontsize=10)
     ax.legend(fontsize=10, ncol=5, loc='upper left', framealpha=0.85)
@@ -272,11 +254,7 @@ def plot_price_series():
         ax.plot(monthly_log.index, monthly_log[zone],
                 color=ZONE_COLORS[zone], lw=1.5, marker='o', ms=3.5,
                 alpha=0.9, label=zone)
-    ax.set_title(
-        f'Swedish Electricity Spot Prices – ln(VWAP + {shift_d:.2f}) – SE1 to SE4\n'
-        f'Monthly Average, 2015–2025  |  Shift = {shift_d:.4f} EUR/MWh',
-        fontsize=11, fontweight='bold',
-    )
+    
     ax.set_xlabel('Date', fontsize=10)
     ax.set_ylabel(f'ln(VWAP + {shift_d:.2f})  [EUR/MWh]', fontsize=10)
     ax.legend(fontsize=10, ncol=4, loc='upper left', framealpha=0.85)
@@ -291,11 +269,7 @@ def plot_price_series():
         ax.plot(monthly_vol_raw.index, monthly_vol_raw[zone],
                 color=ZONE_COLORS[zone], lw=1.5, marker='o', ms=3.5,
                 alpha=0.9, label=zone)
-    ax.set_title(
-        'Swedish Electricity Price Volatility – SE1 to SE4\n'
-        'Monthly Average of Daily Intra-Day Std Dev (EUR/MWh), 2015–2025',
-        fontsize=12, fontweight='bold',
-    )
+    
     ax.set_xlabel('Date', fontsize=10)
     ax.set_ylabel('Mean Daily Std Dev (EUR/MWh)', fontsize=10)
     ax.legend(fontsize=10, ncol=4, loc='upper left', framealpha=0.85)
@@ -310,11 +284,7 @@ def plot_price_series():
         ax.plot(monthly_vol_log.index, monthly_vol_log[zone],
                 color=ZONE_COLORS[zone], lw=1.5, marker='o', ms=3.5,
                 alpha=0.9, label=zone)
-    ax.set_title(
-        f'Swedish Electricity Price Volatility – SE1 to SE4\n'
-        f'Monthly Average of Daily Std Dev of ln(Price + {shift_h:.2f}), 2015–2025',
-        fontsize=11, fontweight='bold',
-    )
+   
     ax.set_xlabel('Date', fontsize=10)
     ax.set_ylabel(f'Mean Std Dev of ln(Price + {shift_h:.2f})', fontsize=10)
     ax.legend(fontsize=10, ncol=4, loc='upper left', framealpha=0.85)
