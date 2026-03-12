@@ -45,10 +45,10 @@ YEARS          = list(range(2015, 2026))
 ZONES          = ['SE1', 'SE2', 'SE3', 'SE4']
 
 ZONE_COLORS = {
-    'SE1': '#3C5488',
-    'SE2': '#4DBBD5',
-    'SE3': '#00A087',
-    'SE4': '#E64B35',
+    'SE1': '#08306b',
+    'SE2': '#2171b5',
+    'SE3': '#6baed6',
+    'SE4': '#bdd7e7',
 }
 
 # Raw partner label  ->  aggregated country name shown in table
@@ -80,14 +80,18 @@ PARTNER_ORDER = ['SE1', 'SE2', 'SE3', 'SE4',
 #  1. NEGATIVE PRICES
 # ══════════════════════════════════════════════════════════════════════════════
 
-def count_negative_prices():
-    """Return DataFrame(Zone, Year, NegativeHours) from hourly spot price file."""
+def load_spot_prices():
+    """Load hourly spot price data for all zones; return DataFrame with Year column."""
     print('  Loading spot price data …')
     price_cols = ['Timestamp'] + [f'{z}_Price (EUR)' for z in ZONES]
     df = pd.read_excel(SPOT_PRICE_FILE, usecols=price_cols)
     df['Year'] = pd.to_datetime(df['Timestamp']).dt.year
-    df = df[df['Year'].between(2015, 2025)]
+    return df[df['Year'].between(2015, 2025)]
 
+
+def count_negative_prices(price_df=None):
+    """Return DataFrame(Zone, Year, NegativeHours) from hourly spot price file."""
+    df = price_df if price_df is not None else load_spot_prices()
     records = []
     for zone in ZONES:
         col = f'{zone}_Price (EUR)'
@@ -117,11 +121,6 @@ def plot_negative_prices(neg_df):
     ax.set_xticklabels([str(y) for y in YEARS], rotation=45, ha='right', fontsize=9)
     ax.set_ylabel('Number of Hours with Negative Price', fontsize=10)
     ax.set_xlabel('Year', fontsize=10)
-    ax.set_title(
-        'Hours with Negative Electricity Prices by Bidding Zone\n'
-        'Annual Totals, 2015–2025',
-        fontsize=13, fontweight='bold',
-    )
     ax.legend(title='Bidding Zone', framealpha=0.9, fontsize=9)
     ax.grid(axis='y', alpha=0.25, linewidth=0.7)
     ax.spines['top'].set_visible(False)
@@ -191,11 +190,6 @@ def plot_net_exports(net_df):
     ax.set_xticklabels([str(y) for y in years], rotation=45, ha='right', fontsize=9)
     ax.set_ylabel('Net Exports (TWh)', fontsize=10)
     ax.set_xlabel('Year', fontsize=10)
-    ax.set_title(
-        'Annual Net Electricity Exports by Bidding Zone\n'
-        '2015–2025  (positive = net exporter)',
-        fontsize=13, fontweight='bold',
-    )
     ax.legend(title='Bidding Zone', framealpha=0.9, fontsize=9)
     ax.grid(axis='y', alpha=0.25, linewidth=0.7)
     ax.spines['top'].set_visible(False)

@@ -51,15 +51,17 @@ PROD_TYPES = [
 ]
 
 # Consistent colors per generation type
+# Blues (darkest → lightest) for clean/low-emission sources;
+# Greys (darkest → lightest) for fossil/unspecified sources.
 TYPE_COLORS = {
-    'Nuclear':              '#E64B35',   # red
-    'Hydro Water Reservoir':'#4DBBD5',   # teal/blue
-    'Wind Onshore':         '#3C5488',   # dark blue
-    'Wind Offshore':        '#7E9CCF',   # light blue
-    'Solar':                '#F39B7F',   # orange
-    'Fossil Gas':           '#8D8D8D',   # grey
-    'Marine':               '#00A087',   # green
-    'Other':                '#B09C85',   # brown
+    'Nuclear':              '#0a1628',   # near-black navy
+    'Hydro Water Reservoir':'#164f8e',   # dark navy blue
+    'Wind Onshore':         '#3d8bc4',   # medium blue
+    'Wind Offshore':        '#7cbddf',   # light blue
+    'Solar':                '#bddcf0',   # pale blue
+    'Fossil Gas':           '#383838',   # dark charcoal
+    'Marine':               '#7a7a7a',   # medium grey
+    'Other':                '#bebebe',   # light grey
 }
 
 ZONE_TITLES = {
@@ -170,11 +172,6 @@ def plot_production_mix(zone_data):
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
 
-    fig.suptitle(
-        'Swedish Electricity Production by Generation Type and Bidding Zone\n'
-        'Annual Totals, 2015–2025 (TWh)',
-        fontsize=14, fontweight='bold', y=1.01,
-    )
 
     # Shared legend below all subplots
     fig.legend(

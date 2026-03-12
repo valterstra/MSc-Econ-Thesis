@@ -1,0 +1,21 @@
+\begin{table}[htbp]
+  \centering
+  \small
+  \caption{Gianfreda $\pm3\sigma$ outlier removal by bidding zone and regime (structural break: 2021-10-01)}
+  \label{tab:outlier_removal}
+  \begin{tabular}{l rrr rrr rrr}
+    \toprule
+    & \multicolumn{3}{c}{Pre-break (2015--2021)} & \multicolumn{3}{c}{Post-break (2021--2025)} & \multicolumn{3}{c}{Total} \\
+    \cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}
+    Zone & $N$ & Outliers & \% & $N$ & Outliers & \% & $N$ & Outliers & \% \\
+    \midrule
+    SE1 & 59,195 & 621 & 1.049 & 37,280 & 619 & 1.660 & 96,475 & 1,240 & 1.285 \\
+    SE2 & 59,195 & 641 & 1.083 & 37,280 & 564 & 1.513 & 96,475 & 1,205 & 1.249 \\
+    SE3 & 59,195 & 472 & 0.797 & 37,280 & 148 & 0.397 & 96,475 & 620 & 0.643 \\
+    SE4 & 59,195 & 572 & 0.966 & 37,280 & 44 & 0.118 & 96,475 & 616 & 0.639 \\
+    \midrule
+    \textit{All zones} & 236,780 & 2,306 & 0.974 & 149,120 & 1,375 & 0.922 & 385,900 & 3,681 & 0.954 \\
+    \bottomrule
+  \end{tabular}
+  \begin{minipage}{\linewidth}    \footnotesize\vspace{4pt}    \textit{Notes:} Outliers are capped (Winsorised) at the per-weekday $\pm3\sigma$ bound within each regime; the series length $N$ is unchanged after treatment. Percentages show the share of observations exceeding the bound.  \end{minipage}
+\end{table}

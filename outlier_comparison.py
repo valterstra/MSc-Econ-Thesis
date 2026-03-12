@@ -203,11 +203,12 @@ def _bounds_series_sb(series:     pd.Series,
 def make_figure_zone(zone:        str,
                      series:      pd.Series,
                      break_date:  pd.Timestamp,
-                     n_sigma:     float) -> None:
+                     n_sigma:     float) -> dict:
     """
     Build and save one figure for a single zone:
       Gianfreda ±n_sigma per weekday, structural break at break_date.
     Output: outlier_gianfreda_{int(n_sigma)}sd_{zone}.png
+    Returns a dict of outlier stats for the summary table.
     """
     print(f"\n  ── Zone {zone} ───────────────────────────────────────────────────")
 
@@ -297,10 +298,109 @@ def make_figure_zone(zone:        str,
     # 7. Cosmetics
     ax.set_xlabel('Date', fontsize=10)
     ax.set_ylabel('Deseas. Log Price', fontsize=9)
+    ax.set_ylim(-3, 3)
     ax.legend(fontsize=8, ncol=4, loc='upper right', framealpha=0.85)
     ax.grid(True, alpha=0.20)
 
     _save(fig, f'outlier_gianfreda_{int(n_sigma)}sd_{zone}.png')
+
+    return {
+        'zone':      zone,
+        'n_total':   n_total,
+        'n_pre':     n_pre_t,
+        'n_post':    n_post_t,
+        'out_total': n_out,
+        'out_pre':   n_pre,
+        'out_post':  n_post,
+        'pct_total': pct,
+        'pct_pre':   pct_pre,
+        'pct_post':  pct_post,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  LATEX TABLE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def write_latex_table(all_stats: list, n_sigma: float) -> None:
+    """
+    Write a booktabs LaTeX table summarising outlier removal per zone.
+    Columns: Zone | pre-break (N, Outliers, %) | post-break (N, Outliers, %) | Total (N, Outliers, %)
+    """
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    path = os.path.join(OUTPUT_DIR, 'outlier_summary_table.tex')
+
+    lines = []
+    lines.append(r'\begin{table}[htbp]')
+    lines.append(r'  \centering')
+    lines.append(r'  \small')
+    lines.append(
+        r'  \caption{Gianfreda $\pm' + f'{n_sigma:.0f}' + r'\sigma$ outlier removal '
+        r'by bidding zone and regime (structural break: 2021-10-01)}'
+    )
+    lines.append(r'  \label{tab:outlier_removal}')
+    lines.append(r'  \begin{tabular}{l rrr rrr rrr}')
+    lines.append(r'    \toprule')
+    lines.append(
+        r'    & \multicolumn{3}{c}{Pre-break (2015--2021)}'
+        r' & \multicolumn{3}{c}{Post-break (2021--2025)}'
+        r' & \multicolumn{3}{c}{Total} \\'
+    )
+    lines.append(r'    \cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}')
+    lines.append(
+        r'    Zone & $N$ & Outliers & \% '
+        r'& $N$ & Outliers & \% '
+        r'& $N$ & Outliers & \% \\'
+    )
+    lines.append(r'    \midrule')
+
+    for s in all_stats:
+        row = (
+            f"    {s['zone']}"
+            f" & {s['n_pre']:,} & {s['out_pre']:,} & {s['pct_pre']:.3f}"
+            f" & {s['n_post']:,} & {s['out_post']:,} & {s['pct_post']:.3f}"
+            f" & {s['n_total']:,} & {s['out_total']:,} & {s['pct_total']:.3f}"
+            r" \\"
+        )
+        lines.append(row)
+
+    # Grand totals row
+    tot_n_pre   = sum(s['n_pre']   for s in all_stats)
+    tot_n_post  = sum(s['n_post']  for s in all_stats)
+    tot_n       = sum(s['n_total'] for s in all_stats)
+    tot_out_pre  = sum(s['out_pre']  for s in all_stats)
+    tot_out_post = sum(s['out_post'] for s in all_stats)
+    tot_out      = sum(s['out_total'] for s in all_stats)
+    pct_g_pre  = 100.0 * tot_out_pre  / tot_n_pre  if tot_n_pre  > 0 else 0.0
+    pct_g_post = 100.0 * tot_out_post / tot_n_post if tot_n_post > 0 else 0.0
+    pct_g      = 100.0 * tot_out      / tot_n      if tot_n      > 0 else 0.0
+
+    lines.append(r'    \midrule')
+    grand = (
+        r'    \textit{All zones}'
+        f" & {tot_n_pre:,} & {tot_out_pre:,} & {pct_g_pre:.3f}"
+        f" & {tot_n_post:,} & {tot_out_post:,} & {pct_g_post:.3f}"
+        f" & {tot_n:,} & {tot_out:,} & {pct_g:.3f}"
+        r" \\"
+    )
+    lines.append(grand)
+
+    lines.append(r'    \bottomrule')
+    lines.append(r'  \end{tabular}')
+    lines.append(
+        r'  \begin{minipage}{\linewidth}'
+        r'    \footnotesize\vspace{4pt}'
+        r'    \textit{Notes:} Outliers are capped (Winsorised) at the per-weekday'
+        r' $\pm' + f'{n_sigma:.0f}' + r'\sigma$ bound within each regime; the series'
+        r' length $N$ is unchanged after treatment. Percentages show the share of'
+        r' observations exceeding the bound.'
+        r'  \end{minipage}'
+    )
+    lines.append(r'\end{table}')
+
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write('\n'.join(lines) + '\n')
+    print(f"\n  LaTeX table saved -> {path}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -325,6 +425,8 @@ if __name__ == '__main__':
     print("  GIANFREDA ±3σ OUTLIER DETECTION  –  ALL SE ZONES")
     print(f"  Break: {MANUAL_BREAK.date()}  |  Zones: {', '.join(ZONES)}")
     print("═" * 72)
+
+    all_stats = []
 
     for zone in ZONES:
         print(f"\n{'─'*72}")
@@ -356,11 +458,16 @@ if __name__ == '__main__':
 
         # ── Figure ────────────────────────────────────────────────────────────
         print(f"  [3/3] Building figure …")
-        make_figure_zone(zone, series, MANUAL_BREAK, N_SIGMA)
+        stats = make_figure_zone(zone, series, MANUAL_BREAK, N_SIGMA)
+        all_stats.append(stats)
 
         del series
         gc.collect()
 
+    # ── LaTeX summary table ───────────────────────────────────────────────────
+    write_latex_table(all_stats, N_SIGMA)
+
     print(f"\nDone.  All 4 figures saved to:  {OUTPUT_DIR}")
     for zone in ZONES:
         print(f"  outlier_gianfreda_{int(N_SIGMA)}sd_{zone}.png")
+    print(f"  outlier_summary_table.tex")

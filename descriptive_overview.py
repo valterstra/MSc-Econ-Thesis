@@ -46,13 +46,14 @@ warnings.filterwarnings('ignore')
 # ══════════════════════════════════════════════════════════════════════════════
 ZONES      = ['SE1', 'SE2', 'SE3', 'SE4']
 YEAR_TABLE = 2025
+HIST_YEARS = [2015, 2020, 2025]
 OUTPUT_DIR = 'results/descriptive_overview'
 
 ZONE_COLORS = {
-    'SE1': '#4477AA',   # blue
-    'SE2': '#228833',   # green
-    'SE3': '#CCBB44',   # gold
-    'SE4': '#EE6677',   # red
+    'SE1': '#08306b',
+    'SE2': '#2171b5',
+    'SE3': '#6baed6',
+    'SE4': '#bdd7e7',
 }
 
 # Trading partners derived from bottleneck (BNECK) column names in source data
@@ -192,11 +193,6 @@ def plot_price_series():
     for zone in ZONES:
         ax.plot(daily_std.index, daily_std[zone],
                 color=ZONE_COLORS[zone], lw=0.9, alpha=0.85, label=zone)
-    ax.set_title(
-        'Swedish Electricity Price Volatility – SE1 to SE4\n'
-        'c',
-        fontsize=12, fontweight='bold',
-    )
     ax.set_xlabel('Date', fontsize=10)
     ax.set_ylabel('Price Std Dev (EUR/MWh)', fontsize=10)
     ax.legend(fontsize=10, ncol=4, loc='upper left', framealpha=0.85)
@@ -520,6 +516,57 @@ def _production_latex(rows):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  4.  PRICE HISTOGRAMS  (2015, 2020, 2025  ×  SE1–SE4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_price_histograms():
+    """Save one histogram PNG per zone × year (12 files). Both axes are
+    identical across all 12 figures so comparisons are visually consistent."""
+    print("\n[4/4]  Price histograms (2015, 2020, 2025) …")
+
+    price_df = _load_hourly_prices()
+    price_df = price_df[price_df.index.year.isin(HIST_YEARS)]
+
+    BINS = 60
+
+    # Global x-axis limits
+    x_min = price_df[ZONES].min().min()
+    x_max = price_df[ZONES].max().max()
+    x_pad = (x_max - x_min) * 0.02
+    xlims = (x_min - x_pad, x_max + x_pad)
+
+    # Global y-axis limit: pre-compute bin counts for every combination
+    y_max = 0
+    for zone in ZONES:
+        for year in HIST_YEARS:
+            data = price_df.loc[price_df.index.year == year, zone].dropna()
+            counts, _ = np.histogram(data, bins=BINS, range=(x_min, x_max))
+            y_max = max(y_max, counts.max())
+    y_pad = y_max * 0.05
+    ylims = (0, y_max + y_pad)
+
+    for zone in ZONES:
+        for year in HIST_YEARS:
+            fig, ax = plt.subplots(figsize=(6, 4))
+            data = price_df.loc[price_df.index.year == year, zone].dropna()
+
+            ax.hist(data, bins=BINS, range=(x_min, x_max),
+                    color=ZONE_COLORS[zone], edgecolor='none', alpha=0.85)
+            ax.axvline(0, color='black', linewidth=0.8, linestyle='--', alpha=0.5)
+
+            ax.set_xlim(xlims)
+            ax.set_ylim(ylims)
+            ax.set_xlabel('Price (EUR/MWh)', fontsize=10)
+            ax.set_ylabel('Hours', fontsize=10)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.tick_params(labelsize=9)
+
+            fig.tight_layout()
+            _save_fig(fig, f'price_histogram_{zone}_{year}.png')
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -532,6 +579,7 @@ if __name__ == '__main__':
     plot_price_series()
     build_flows_table()
     build_production_table()
+    plot_price_histograms()
 
     print("\n" + "=" * 72)
     print(f"  Done.  Outputs saved to: {OUTPUT_DIR}/")
@@ -545,4 +593,5 @@ if __name__ == '__main__':
     print("    monthly_volatility_log.png    (monthly avg of daily std of ln-prices)")
     print("    cross_border_flows_2025.tex")
     print("    production_mix_2025.tex")
+    print("    price_histogram_{zone}_{year}.png  (12 files)")
     print("=" * 72)
