@@ -71,7 +71,7 @@ if ($successCount -gt 0) {
     Write-Host "You should now be able to run your Python scripts without issues." -ForegroundColor Green
     Write-Host ""
     Write-Host "To verify, run your script again:" -ForegroundColor Cyan
-    Write-Host "  python full_regression.py" -ForegroundColor Yellow
+    Write-Host "  python python/stata_inputs/full_period_export.py" -ForegroundColor Yellow
 }
 
 Write-Host ""

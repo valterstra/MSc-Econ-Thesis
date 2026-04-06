@@ -2,7 +2,7 @@
 
 This document is the authoritative reference for how every variable is transformed
 before it enters the regression. It mirrors the implementation in `preprocessing.py`
-and is called by `full_regression.py` via `preprocess_data_for_regression()`.
+and is called by the Python export scripts via `preprocess_data_for_regression()`. 
 
 ---
 

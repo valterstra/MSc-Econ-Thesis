@@ -23,6 +23,8 @@ data/
 !master data files/
 !master data files/*.xlsx
 !master data files/**
+master data files/verified exchange/
+master data files/verified wind/
 
 # Plots (can be regenerated)
 plots/
@@ -30,6 +32,17 @@ plots/
 *.jpg
 *.jpeg
 *.pdf
+
+# Generated thesis outputs
+output/
+output from stata/
+descriptive_overview/
+diagnostics plots/
+full_regression_output/
+results/
+
+# Local scratch / deprecated duplicates
+thread_tests/
 
 # System files
 .DS_Store
