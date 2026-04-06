@@ -1,0 +1,2 @@
+start_date,end_date,act_break_date,seasonal_interactions,use_interpolation,lag_commodity_hours,use_bilateral_exchange,controls,per_zone_files,stacked_common_file
+2024-01-01,2025-12-31,2024-10-30 00:00:00,hour_dow_month,1,24,1,"Wind,Consumption",1,1

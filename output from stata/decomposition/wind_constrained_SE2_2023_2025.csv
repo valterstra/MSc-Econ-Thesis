@@ -1,0 +1,17 @@
+label,value
+b_wind_2023,-.0224514547735453
+b_wind_2025_free,-.0887245759367943
+b_wind_2025_constrained,-.0140507748448455
+b_wind_2025_constrained_se,.0078759007783566
+b_wind_2025_constrained_p,.0744202020665545
+wind_change_total,-.066273121163249
+wind_exchange_attributed,-.0746738010919488
+wind_change_constrained,.0084006799286998
+pct_exchange_attributed,112.6758477362286
+ll_constrained,9725.712649196799
+aic_constrained,-19411.4252983936
+bic_constrained,-19269.92114443391
+b23_netexch_no3,.0000487593533762
+b23_netexch_no4,.0000193775667867
+b23_netexch_se1,.0000235980660364
+b23_netexch_se3,-3.55606675839e-06

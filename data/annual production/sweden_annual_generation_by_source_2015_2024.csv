@@ -1,0 +1,73 @@
+"Bruttoproduktion, GWh efter kraftslag, år och elområde"
+
+"kraftslag","år","Riket","SE1","SE2","SE3","SE4"
+"vattenkraft","2015",75439,19623,41944,12542,1330
+"vattenkraft","2016",62255,20252,31697,9298,1008
+"vattenkraft","2017",65168,19203,36129,8642,1193
+"vattenkraft","2018",62250,18851,33911,8499,989
+"vattenkraft","2019",65393,18424,35356,10362,1251
+"vattenkraft","2020",72440,18841,41225,11100,1274
+"vattenkraft","2021",73926,22299,39060,11342,1225
+"vattenkraft","2022",69967,22633,38795,7578,961
+"vattenkraft","2023",66240,19329,33493,11853,1565
+"vattenkraft","2024",64664,16846,34930,11518,1370
+"vindkraft","2015",16268,1354,5266,5524,4124
+"vindkraft","2016",15479,1176,5505,5005,3792
+"vindkraft","2017",17609,1355,6326,5537,4391
+"vindkraft","2018",16623,1392,6430,5087,3714
+"vindkraft","2019",19847,2405,6845,6405,4193
+"vindkraft","2020",27526,4015,11085,7951,4473
+"vindkraft","2021",27244,4705,11124,7441,3974
+"vindkraft","2022",33253,5623,14595,8098,4937
+"vindkraft","2023",34245,5845,14399,8372,5629
+"vindkraft","2024",40622,7575,17304,9877,5866
+"solkraft","2015",..,..,..,..,..
+"solkraft","2016",143,1,6,98,38
+"solkraft","2017",230,2,11,156,60
+"solkraft","2018",391,4,21,265,100
+"solkraft","2019",663,6,36,447,175
+"solkraft","2020",1035,8,57,708,262
+"solkraft","2021",1507,18,79,1002,408
+"solkraft","2022",1963,16,79,1219,649
+"solkraft","2023",3098,14,110,1907,1067
+"solkraft","2024",4146,21,141,2610,1374
+"kärnkraft","2015",56348,..,..,56348,..
+"kärnkraft","2016",63101,..,..,63101,..
+"kärnkraft","2017",65696,..,..,65696,..
+"kärnkraft","2018",68549,..,..,68549,..
+"kärnkraft","2019",66130,..,..,66130,..
+"kärnkraft","2020",49198,..,..,49198,..
+"kärnkraft","2021",52965,..,..,52965,..
+"kärnkraft","2022",51944,..,..,51944,..
+"kärnkraft","2023",48470,..,..,48470,..
+"kärnkraft","2024",50665,..,..,50665,..
+"konventionell värmekraft (industriellt mottryck, kraftvärme, kondenskraft, gasturbiner, annan)","2015",13906,1331,2323,6940,3312
+"konventionell värmekraft (industriellt mottryck, kraftvärme, kondenskraft, gasturbiner, annan)","2016",15151,1470,2319,8090,3272
+"konventionell värmekraft (industriellt mottryck, kraftvärme, kondenskraft, gasturbiner, annan)","2017",15547,1583,2396,8692,2876
+"konventionell värmekraft (industriellt mottryck, kraftvärme, kondenskraft, gasturbiner, annan)","2018",15572,1588,2287,8828,2869
+"konventionell värmekraft (industriellt mottryck, kraftvärme, kondenskraft, gasturbiner, annan)","2019",16390,1299,2954,9266,2871
+"konventionell värmekraft (industriellt mottryck, kraftvärme, kondenskraft, gasturbiner, annan)","2020",13619,1409,2618,7197,2395
+"konventionell värmekraft (industriellt mottryck, kraftvärme, kondenskraft, gasturbiner, annan)","2021",16138,1461,2878,8711,3088
+"konventionell värmekraft (industriellt mottryck, kraftvärme, kondenskraft, gasturbiner, annan)","2022",16015,1236,2773,8648,3358
+"konventionell värmekraft (industriellt mottryck, kraftvärme, kondenskraft, gasturbiner, annan)","2023",14025,1173,2831,7177,2844
+"konventionell värmekraft (industriellt mottryck, kraftvärme, kondenskraft, gasturbiner, annan)","2024",12255,907,2637,6119,2592
+"- varav förnybar elproduktion","2015",..,..,..,..,..
+"- varav förnybar elproduktion","2016",..,..,..,..,..
+"- varav förnybar elproduktion","2017",..,..,..,..,..
+"- varav förnybar elproduktion","2018",..,..,..,..,..
+"- varav förnybar elproduktion","2019",..,..,..,..,..
+"- varav förnybar elproduktion","2020",11013,666,2515,5724,2109
+"- varav förnybar elproduktion","2021",13096,744,2752,7021,2579
+"- varav förnybar elproduktion","2022",12990,666,2660,6991,2672
+"- varav förnybar elproduktion","2023",11525,618,2693,5663,2550
+"- varav förnybar elproduktion","2024",9871,525,2375,4776,2196
+"- varav icke förnybar elproduktion","2015",..,..,..,..,..
+"- varav icke förnybar elproduktion","2016",..,..,..,..,..
+"- varav icke förnybar elproduktion","2017",..,..,..,..,..
+"- varav icke förnybar elproduktion","2018",..,..,..,..,..
+"- varav icke förnybar elproduktion","2019",..,..,..,..,..
+"- varav icke förnybar elproduktion","2020",2606,743,103,1404,355
+"- varav icke förnybar elproduktion","2021",3042,717,126,1690,509
+"- varav icke förnybar elproduktion","2022",3025,570,113,1657,686
+"- varav icke förnybar elproduktion","2023",2500,555,138,1514,294
+"- varav icke förnybar elproduktion","2024",2384,382,262,1343,396
