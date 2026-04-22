@@ -7,11 +7,12 @@ cd "C:\Users\ValterAdmin\Documents\VS code projects\EconMScThesis"
 /*============================================================================
   robustness_garch.do
 
-  Robustness check: ARMAX(1,1)-GARCH-X(1,1) with progressive control removal.
-  ARMA order is fixed at (1,1) across all specifications.
+  Robustness check: ARMAX(3,0,1)-GARCH-X(1,1) with progressive control removal.
+  ARMA order is fixed at (3,1) across all specifications.
+  Uses the same updated input export as garch_from_python_joint_t.do.
 
   Model:
-    Mean eq. : price_ds = c + β·X_t + AR(1) + MA(1) + ε_t
+    Mean eq. : price_ds = c + β·X_t + AR(3) + MA(1) + ε_t
     Var. eq. : h_t = [ω + α·ε²_{t-1} + δ·h_{t-1}] · exp(Σ γ_k · x_kt)
     (multiplicative GARCH-X via het(); same controls in both equations)
 
@@ -21,7 +22,7 @@ cd "C:\Users\ValterAdmin\Documents\VS code projects\EconMScThesis"
     3  Drop gas_log + oil_log
     4  Drop gas_log + oil_log + all netexch_* cols
     5  Spec 4  +  drop consump_log_ds
-    6  Spec 5  +  drop hydro_log_ds   [wind_log + AR(1) + MA(1) only]
+    6  Spec 5  +  drop hydro_log_ds   [wind_log + AR(3) + MA(1) only]
 
   Output  →  output from stata/robustness/garch/robustness_garch_<ZONE>_<PERIOD>.csv
 
@@ -29,13 +30,21 @@ cd "C:\Users\ValterAdmin\Documents\VS code projects\EconMScThesis"
 ============================================================================*/
 
 * ── Configuration ──────────────────────────────────────────────────────────
-global DATA_FILE "stata_input/armax/armax_input_SE1_2025-01-01_2025-12-31_log.csv"
-global ZONE      "SE1"
+global DATA_FILE "stata_input/armax_garch/input_SE4_2025-01-01_2025-12-31_log.csv"
+global ZONE      "SE4"
 global PERIOD    "2025"
+global T_DF     5
 * ───────────────────────────────────────────────────────────────────────────
 
 capture mkdir "output from stata/robustness"
 capture mkdir "output from stata/robustness/garch"
+
+if $T_DF > 0 {
+    local dist_spec "distribution(t $T_DF)"
+}
+else {
+    local dist_spec "distribution(t)"
+}
 
 /*============================================================================
   1.  Load data and set up time series
@@ -95,7 +104,7 @@ local slabel2 "Drop gas"
 local slabel3 "Drop energy prices"
 local slabel4 "Drop trade flows"
 local slabel5 "Drop consumption"
-local slabel6 "Wind + ARMA(1,1) only"
+local slabel6 "Wind + ARMA(3,1) only"
 
 /*============================================================================
   3.  Postfile for results
@@ -126,10 +135,10 @@ forval s = 1/`n_specs' {
     display    "   Controls (mean + variance): `curr_c'"
 
     capture arch `depvar' `curr_c',  ///
-        ar(1) ma(1)                  ///
+        ar(1/3) ma(1/1)              ///
         arch(1) garch(1)             ///
         het(`curr_c')                ///
-        distribution(gaussian)       ///
+        `dist_spec'                  ///
         vce(robust)                  ///
         difficult                    ///
         nrtolerance(1e-3)
@@ -173,17 +182,17 @@ forval s = 1/`n_specs' {
             (sc_coef) (sc_se) (sc_pval) ("`st'") (sc_nobs) (sc_ll) (sc_aic) (sc_bic)
     }
 
-    * ── AR(1) ───────────────────────────────────────────────────────────
-    quietly {
-        scalar sc_coef = _b[ARMA:L1.ar]
-        scalar sc_se   = _se[ARMA:L1.ar]
-        scalar sc_pval = 2*(1 - normal(abs(sc_coef / sc_se)))
-        local  st      = cond(sc_pval<0.01,"***",cond(sc_pval<0.05,"**",cond(sc_pval<0.10,"*","")))
+    forval i = 1/3 {
+        quietly {
+            scalar sc_coef = _b[ARMA:L`i'.ar]
+            scalar sc_se   = _se[ARMA:L`i'.ar]
+            scalar sc_pval = 2*(1 - normal(abs(sc_coef / sc_se)))
+            local  st      = cond(sc_pval<0.01,"***",cond(sc_pval<0.05,"**",cond(sc_pval<0.10,"*","")))
+        }
+        post rob_garch (`s') ("`sid`s''") ("`slabel`s''") ("ar_L`i'") ///
+            (sc_coef) (sc_se) (sc_pval) ("`st'") (sc_nobs) (sc_ll) (sc_aic) (sc_bic)
     }
-    post rob_garch (`s') ("`sid`s''") ("`slabel`s''") ("ar_L1") ///
-        (sc_coef) (sc_se) (sc_pval) ("`st'") (sc_nobs) (sc_ll) (sc_aic) (sc_bic)
 
-    * ── MA(1) ───────────────────────────────────────────────────────────
     quietly {
         scalar sc_coef = _b[ARMA:L1.ma]
         scalar sc_se   = _se[ARMA:L1.ma]
@@ -256,7 +265,7 @@ display _n "Saved → `outfile'  (" _N " rows)"
   6.  Wind-coefficient stability summary table
 ============================================================================*/
 display _n "{hline 72}"
-display    "  Wind coefficient stability  —  ARMAX(1,1)-GARCH-X(1,1)"
+display    "  Wind coefficient stability  —  ARMAX(3,0,1)-GARCH-X(1,1)"
 display    "  Zone: ${ZONE}   Period: ${PERIOD}"
 display    "{hline 72}"
 display    "  #   Specification" _col(32) "Mean eq." _col(44) "SE" _col(52) "Var eq.(γ)" _col(64) "SE"

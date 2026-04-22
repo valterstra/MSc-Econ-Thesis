@@ -42,6 +42,9 @@ RESULTS_DIR = 'output from stata/rolling_window_results'
 #   'twostep_t5'        — two-step ARMAX then GARCH-X with Student-t(5) errors
 #   'joint_t5_interact' — joint t(5) with spike/low regime interactions (dual regime)
 SPEC = 'joint_t5_interact'
+# Match the Stata tail setting used to generate the rolling results.
+# 10 -> tail_10pct, 20 -> tail_20pct.
+TAIL_PCT = 30
 
 _SPEC_CONFIG = {
     'joint_gaussian': {
@@ -114,7 +117,10 @@ def load_zone(zone: str) -> pd.DataFrame:
     """
     subdir = _CFG['results_subdir']
     fname  = _CFG['file_pattern'].format(zone=zone)
-    path   = os.path.join(RESULTS_DIR, subdir, fname) if subdir else os.path.join(RESULTS_DIR, fname)
+    if _CFG.get('has_regimes'):
+        path = os.path.join(RESULTS_DIR, subdir, f'tail_{TAIL_PCT}pct', fname)
+    else:
+        path = os.path.join(RESULTS_DIR, subdir, fname) if subdir else os.path.join(RESULTS_DIR, fname)
     raw    = pd.read_csv(path)
 
     def extract(type_val, var_val, value_name, se_name):
@@ -341,14 +347,17 @@ def print_garch_tables() -> None:
 if __name__ == '__main__':
     suffix  = _CFG['file_suffix']
     _subdir = _CFG.get('results_subdir', '')
-    out_dir = os.path.join(RESULTS_DIR, _subdir) if _subdir else RESULTS_DIR
+    if _CFG.get('has_regimes'):
+        out_dir = os.path.join(RESULTS_DIR, _subdir, f'tail_{TAIL_PCT}pct')
+    else:
+        out_dir = os.path.join(RESULTS_DIR, _subdir) if _subdir else RESULTS_DIR
     plot_dir = os.path.join(out_dir, 'plots_v2')
 
     if _CFG.get('has_regimes'):
         for regime, coef_col, se_col, regime_label in [
             ('normal', 'b_wind_normal', 'se_wind_normal', 'normal regime (\u03b2\u2081)'),
-            ('spike',  'b_wind_spike',  'se_wind_spike',  'spike regime (\u03b2\u2081+\u03b2\u2083, top 10%)'),
-            ('low',    'b_wind_low',    'se_wind_low',    'low regime (\u03b2\u2081+\u03b2\u2084, bottom 10%)'),
+            ('spike',  'b_wind_spike',  'se_wind_spike',  f'spike regime (\u03b2\u2081+\u03b2\u2083, top {TAIL_PCT}%)'),
+            ('low',    'b_wind_low',    'se_wind_low',    f'low regime (\u03b2\u2081+\u03b2\u2084, bottom {TAIL_PCT}%)'),
         ]:
             plot_coefficient(
                 coef_col     = coef_col,
@@ -369,8 +378,8 @@ if __name__ == '__main__':
     if _CFG.get('has_regimes'):
         for regime, coef_col, se_col, regime_label in [
             ('var_normal', 'b_het_wind_normal', 'se_het_wind_normal', 'normal regime (\u03b3\u2081)'),
-            ('var_spike',  'b_het_wind_spike',  'se_het_wind_spike',  'spike regime (\u03b3\u2081+\u03b3\u2083, top 10%)'),
-            ('var_low',    'b_het_wind_low',    'se_het_wind_low',    'low regime (\u03b3\u2081+\u03b3\u2084, bottom 10%)'),
+            ('var_spike',  'b_het_wind_spike',  'se_het_wind_spike',  f'spike regime (\u03b3\u2081+\u03b3\u2083, top {TAIL_PCT}%)'),
+            ('var_low',    'b_het_wind_low',    'se_het_wind_low',    f'low regime (\u03b3\u2081+\u03b3\u2084, bottom {TAIL_PCT}%)'),
         ]:
             plot_coefficient(
                 coef_col     = coef_col,

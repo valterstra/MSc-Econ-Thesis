@@ -7,33 +7,43 @@ cd "C:\Users\ValterAdmin\Documents\VS code projects\EconMScThesis"
 /*============================================================================
   robustness_armax.do
 
-  Robustness check: plain ARMAX(1,0,1) — no GARCH — with progressive
-  control removal. ARMA order is fixed at (1,1) across all specifications.
+  Student-t ARMAX(3,0,1) robustness check with progressive control removal.
+  No GARCH/X variance dynamics are estimated here. The mean equation matches
+  the rolling-window joint specification: AR(3) + MA(1).
 
-  Specs (accumulated removal — wind_log is never removed):
+  Specs (accumulated removal - wind_log is never removed):
     1  Full model
     2  Drop gas_log
     3  Drop gas_log + oil_log
     4  Drop gas_log + oil_log + all netexch_* cols
-    5  Spec 4  +  drop consump_log_ds
-    6  Spec 5  +  drop hydro_log_ds   [wind_log + AR(1) + MA(1) only]
+    5  Spec 4 + drop consump_log_ds
+    6  Spec 5 + drop hydro_log_ds   [wind_log + AR(3) + MA(1) only]
 
-  Output  →  output from stata/robustness/armax/robustness_armax_<ZONE>_<PERIOD>.csv
-
-  To switch zone / window: change the three globals below only.
+  Output -> output from stata/robustness/armax/robustness_armax_<ZONE>_<PERIOD>.csv
 ============================================================================*/
 
-* ── Configuration ──────────────────────────────────────────────────────────
-global DATA_FILE "stata_input/armax/armax_input_SE1_2025-01-01_2025-12-31_log.csv"
-global ZONE      "SE1"
+* --- Configuration -----------------------------------------------------------
+global DATA_FILE "stata_input/armax_garch/input_SE4_2025-01-01_2025-12-31_log.csv"
+global ZONE      "SE4"
 global PERIOD    "2025"
-* ───────────────────────────────────────────────────────────────────────────
+global T_DF      5
+
+local arma_p = 3
+local arma_d = 0
+local arma_q = 1
+
+if $T_DF > 0 {
+    local dist_spec "distribution(t $T_DF)"
+}
+else {
+    local dist_spec "distribution(t)"
+}
 
 capture mkdir "output from stata/robustness"
 capture mkdir "output from stata/robustness/armax"
 
 /*============================================================================
-  1.  Load data and set up time series
+  1. Load data and set up time series
 ============================================================================*/
 quietly {
     import delimited using "$DATA_FILE", clear varnames(1) case(lower)
@@ -61,7 +71,7 @@ display    "All controls :  `all_controls'"
 display    "NetExch cols :  " cond("`netexch_cols'"=="", "(none)", "`netexch_cols'")
 
 /*============================================================================
-  2.  Build control lists per specification (accumulated removal)
+  2. Build control lists per specification (accumulated removal)
 ============================================================================*/
 local rem_gas     "gas_log"
 local rem_oil     "oil_log"
@@ -90,10 +100,10 @@ local slabel2 "Drop gas"
 local slabel3 "Drop energy prices"
 local slabel4 "Drop trade flows"
 local slabel5 "Drop consumption"
-local slabel6 "Wind + ARMA(1,1) only"
+local slabel6 "Wind + ARMA(3,1) only"
 
 /*============================================================================
-  3.  Postfile for results
+  3. Postfile for results
 ============================================================================*/
 local outfile "output from stata/robustness/armax/robustness_armax_${ZONE}_${PERIOD}.csv"
 
@@ -109,16 +119,28 @@ postfile rob_armax           ///
     using `tmp', replace
 
 /*============================================================================
-  4.  Estimate each specification
+  4. Estimate each specification
 ============================================================================*/
 forval s = 1/`n_specs' {
-
     local curr_c `c`s''
 
-    display _n "── Spec `s' / `n_specs': `slabel`s'' " _dup(40) "─"
+    display _n "Spec `s' / `n_specs': `slabel`s''"
     display    "   Controls: `curr_c'"
 
-    quietly arima `depvar' `curr_c', arima(1,0,1) vce(robust)
+    quietly arch `depvar' `curr_c', ///
+        ar(1/`arma_p') ma(1/`arma_q') ///
+        `dist_spec' ///
+        vce(robust) ///
+        difficult ///
+        nrtolerance(1e-3)
+
+    if _rc != 0 & _rc != 430 {
+        display as error "Spec `s': arch failed with rc=" _rc " - skipping"
+        continue
+    }
+    if _rc == 430 {
+        display as text "Spec `s': NOTE convergence not achieved (r(430)) - estimates at last iteration"
+    }
 
     quietly {
         estat ic
@@ -129,7 +151,6 @@ forval s = 1/`n_specs' {
         scalar sc_nobs  = e(N)
     }
 
-    * ── Constant ────────────────────────────────────────────────────────
     quietly {
         scalar sc_coef = _b[`depvar':_cons]
         scalar sc_se   = _se[`depvar':_cons]
@@ -139,7 +160,6 @@ forval s = 1/`n_specs' {
     post rob_armax (`s') ("`sid`s''") ("`slabel`s''") ("_cons") ///
         (sc_coef) (sc_se) (sc_pval) ("`st'") (sc_nobs) (sc_ll) (sc_aic) (sc_bic)
 
-    * ── Exogenous regressors ────────────────────────────────────────────
     foreach v of local curr_c {
         quietly {
             scalar sc_coef = _b[`depvar':`v']
@@ -151,27 +171,28 @@ forval s = 1/`n_specs' {
             (sc_coef) (sc_se) (sc_pval) ("`st'") (sc_nobs) (sc_ll) (sc_aic) (sc_bic)
     }
 
-    * ── AR(1) ───────────────────────────────────────────────────────────
-    quietly {
-        scalar sc_coef = _b[ARMA:L1.ar]
-        scalar sc_se   = _se[ARMA:L1.ar]
-        scalar sc_pval = 2*(1 - normal(abs(sc_coef / sc_se)))
-        local  st      = cond(sc_pval<0.01,"***",cond(sc_pval<0.05,"**",cond(sc_pval<0.10,"*","")))
+    forval i = 1/`arma_p' {
+        quietly {
+            scalar sc_coef = _b[ARMA:L`i'.ar]
+            scalar sc_se   = _se[ARMA:L`i'.ar]
+            scalar sc_pval = 2*(1 - normal(abs(sc_coef / sc_se)))
+            local  st      = cond(sc_pval<0.01,"***",cond(sc_pval<0.05,"**",cond(sc_pval<0.10,"*","")))
+        }
+        post rob_armax (`s') ("`sid`s''") ("`slabel`s''") ("ar_L`i'") ///
+            (sc_coef) (sc_se) (sc_pval) ("`st'") (sc_nobs) (sc_ll) (sc_aic) (sc_bic)
     }
-    post rob_armax (`s') ("`sid`s''") ("`slabel`s''") ("ar_L1") ///
-        (sc_coef) (sc_se) (sc_pval) ("`st'") (sc_nobs) (sc_ll) (sc_aic) (sc_bic)
 
-    * ── MA(1) ───────────────────────────────────────────────────────────
-    quietly {
-        scalar sc_coef = _b[ARMA:L1.ma]
-        scalar sc_se   = _se[ARMA:L1.ma]
-        scalar sc_pval = 2*(1 - normal(abs(sc_coef / sc_se)))
-        local  st      = cond(sc_pval<0.01,"***",cond(sc_pval<0.05,"**",cond(sc_pval<0.10,"*","")))
+    forval i = 1/`arma_q' {
+        quietly {
+            scalar sc_coef = _b[ARMA:L`i'.ma]
+            scalar sc_se   = _se[ARMA:L`i'.ma]
+            scalar sc_pval = 2*(1 - normal(abs(sc_coef / sc_se)))
+            local  st      = cond(sc_pval<0.01,"***",cond(sc_pval<0.05,"**",cond(sc_pval<0.10,"*","")))
+        }
+        post rob_armax (`s') ("`sid`s''") ("`slabel`s''") ("ma_L`i'") ///
+            (sc_coef) (sc_se) (sc_pval) ("`st'") (sc_nobs) (sc_ll) (sc_aic) (sc_bic)
     }
-    post rob_armax (`s') ("`sid`s''") ("`slabel`s''") ("ma_L1") ///
-        (sc_coef) (sc_se) (sc_pval) ("`st'") (sc_nobs) (sc_ll) (sc_aic) (sc_bic)
 
-    * ── Per-spec summary ────────────────────────────────────────────────
     display "   wind_log : b=" %8.5f _b[`depvar':wind_log] ///
             "  SE=" %7.5f _se[`depvar':wind_log]
     display "   AIC=" %10.2f sc_aic "  BIC=" %10.2f sc_bic "  N=" %6.0f sc_nobs
@@ -180,18 +201,18 @@ forval s = 1/`n_specs' {
 postclose rob_armax
 
 /*============================================================================
-  5.  Export CSV
+  5. Export CSV
 ============================================================================*/
 use `tmp', clear
 export delimited using "`outfile'", replace
 
-display _n "Saved → `outfile'  (" _N " rows)"
+display _n "Saved -> `outfile'  (" _N " rows)"
 
 /*============================================================================
-  6.  Wind-coefficient stability summary table
+  6. Wind-coefficient stability summary table
 ============================================================================*/
 display _n "{hline 68}"
-display    "  Wind coefficient stability  —  ARMAX(1,0,1)  [no GARCH]"
+display    "  Wind coefficient stability - Student-t ARMAX(3,0,1) [no GARCH/X variance]"
 display    "  Zone: ${ZONE}   Period: ${PERIOD}"
 display    "{hline 68}"
 display    "  #   Specification" _col(36) "b(wind_log)" _col(50) "SE" _col(60) "Stars"

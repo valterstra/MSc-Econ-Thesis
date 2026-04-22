@@ -12,8 +12,9 @@ global ACTIVE_ZONE "SE4"
 * Set to a positive integer >= 3 to fix df (e.g. 5, 6, 8).
 * Set to 0 to estimate df freely from the data.
 global T_DF 5
-* Spike threshold percentile (90 = top 10% of price_ds defined within each window)
-global SPIKE_PCT 90
+* Tail percentile used for both spike and low regimes.
+* Set to 10 for top/bottom 10% or 20 for top/bottom 20%.
+global EXTREME_TAIL_PCT 30
 * -----------------------------------------------------------------------------
 
 
@@ -24,7 +25,7 @@ global SPIKE_PCT 90
 * errors and state-dependent wind elasticity (spike regime interaction).
 *
 * Extends rolling_window_garch_joint_t.do by adding, within each window:
-*   dt      = 1 if price_ds > SPIKE_PCT-th percentile of price_ds (spike regime)
+*   dt      = 1 if price_ds > the top tail cutoff of price_ds (spike regime)
 *   dt_wind = dt * wind_log  (interaction term)
 *
 * Mean equation (our spec — includes dt level shift):
@@ -47,12 +48,12 @@ global SPIKE_PCT 90
 *   converged: 1 = clean, 2 = r(430) non-convergence, 0 = hard failure
 *
 * Output:
-*   output from stata/rolling_window_results/joint_t_interact/
+*   output from stata/rolling_window_results/joint_t_interact/tail_{PCT}pct/
 *       rolling_garch_joint_t_interact_{ZONE}_1yr_tdf{T_DF}.csv
 *
 * Usage:
 *   1. Run rolling_window_export.py  ->  CSVs in stata_input/rolling_windows/
-*   2. Set ACTIVE_ZONE / HET_ALL_CONTROLS / PIPELINE / T_DF / SPIKE_PCT above
+*   2. Set ACTIVE_ZONE / T_DF / EXTREME_TAIL_PCT above
 *   3. Run this do-file in Stata
 * ============================================================================
 
@@ -68,8 +69,16 @@ else {
     local df_label "_tdfest"
 }
 
-capture mkdir "output from stata/rolling_window_results"
-capture mkdir "output from stata/rolling_window_results/joint_t_interact"
+local tail_pct = $EXTREME_TAIL_PCT
+local spike_pct = 100 - `tail_pct'
+local low_pct   = `tail_pct'
+
+local output_root "output from stata/rolling_window_results"
+local output_dir  "`output_root'/joint_t_interact/tail_`tail_pct'pct"
+
+capture mkdir "`output_root'"
+capture mkdir "`output_root'/joint_t_interact"
+capture mkdir "`output_dir'"
 
 * Open long-format postfile
 tempname out_post
@@ -94,7 +103,7 @@ postfile `out_post'             ///
 * ============================================================================
 display _n "Zone: $ACTIVE_ZONE  |  Windows: 2015 ... 2025  (11 windows)" _n
 display    "Joint estimation: arch with `dist_spec'" _n
-display    "State-dependent wind elasticity (spike: price_ds > ${SPIKE_PCT}th pct per window)" _n
+display    "State-dependent wind elasticity (spike/low tails: `tail_pct'% per window)" _n
 
 foreach zone in $ACTIVE_ZONE {
     forval start_year = 2015/2025 {
@@ -129,23 +138,23 @@ foreach zone in $ACTIVE_ZONE {
 
         * --------------------------------------------------------------------
         * Generate spike dummy and interaction term (window-specific threshold)
-        * dt      = 1 if price_ds above SPIKE_PCT-th percentile of this window
+        * dt      = 1 if price_ds above the top tail cutoff of this window
         * dt_wind = dt * wind_log
         * --------------------------------------------------------------------
         quietly {
-            summarize `depvar', detail
-            scalar _p_threshold     = r(p${SPIKE_PCT})
-            scalar _p_low_threshold = r(p10)
+            centile `depvar', centile(`low_pct' `spike_pct')
+            scalar _p_low_threshold = r(c_1)
+            scalar _p_threshold     = r(c_2)
             gen byte   dt      = (`depvar' > _p_threshold)     if !missing(`depvar')
             gen double dt_wind = dt * wind_log
             gen byte   dl      = (`depvar' < _p_low_threshold) if !missing(`depvar')
             gen double dl_wind = dl * wind_log
         }
         quietly count if dt == 1
-        display "  Spike threshold (${SPIKE_PCT}th pct): " %8.4f _p_threshold ///
+        display "  Spike threshold (top `tail_pct'%):   " %8.4f _p_threshold ///
             "  Spike obs: " r(N) " (" %4.1f 100*r(N)/_N "%)"
         quietly count if dl == 1
-        display "  Low threshold (10th pct):          " %8.4f _p_low_threshold ///
+        display "  Low threshold (bottom `tail_pct'%): " %8.4f _p_low_threshold ///
             "  Low obs:   " r(N) " (" %4.1f 100*r(N)/_N "%)"
 
         * --------------------------------------------------------------------
@@ -386,7 +395,7 @@ postclose `out_post'
 quietly {
     use `out_file', clear
     export delimited using ///
-        "output from stata/rolling_window_results/joint_t_interact/rolling_garch_joint_t_interact_${ACTIVE_ZONE}_1yr`df_label'.csv", replace
+        "`output_dir'/rolling_garch_joint_t_interact_${ACTIVE_ZONE}_1yr`df_label'.csv", replace
 }
 
-display _n "Results saved to: output from stata/rolling_window_results/joint_t_interact/rolling_garch_joint_t_interact_${ACTIVE_ZONE}_1yr`df_label'.csv"
+display _n "Results saved to: `output_dir'/rolling_garch_joint_t_interact_${ACTIVE_ZONE}_1yr`df_label'.csv"
