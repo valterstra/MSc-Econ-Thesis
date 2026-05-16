@@ -39,9 +39,10 @@ RESULTS_DIR = 'output from stata/rolling_window_results'
 # Choose specification to plot:
 #   'joint_gaussian'    — original joint ARMAX-GARCH with Gaussian errors
 #   'joint_t5'          — joint ARMAX-GARCH with Student-t(5) errors
+#   'joint_t5_floor001' — joint ARMAX-GARCH with capped-price Student-t(5) inputs
 #   'twostep_t5'        — two-step ARMAX then GARCH-X with Student-t(5) errors
 #   'joint_t5_interact' — joint t(5) with spike/low regime interactions (dual regime)
-SPEC = 'joint_t5_interact'
+SPEC = 'joint_t5_floor001'
 # Match the Stata tail setting used to generate the rolling results.
 # 10 -> tail_10pct, 20 -> tail_20pct.
 TAIL_PCT = 30
@@ -63,6 +64,15 @@ _SPEC_CONFIG = {
         'type_var':       'var_coef',
         'file_suffix':    'joint_t5',
         'label':          'Joint t(5)',
+        'has_regimes':    False,
+    },
+    'joint_t5_floor001': {
+        'results_subdir': 'joint_t',
+        'file_pattern':   'rolling_garch_joint_t_{zone}_1yr_log_floor001_tdf5.csv',
+        'type_mean':      'coef',
+        'type_var':       'var_coef',
+        'file_suffix':    'joint_t5_floor001',
+        'label':          'Joint t(5), price floor 0.01',
         'has_regimes':    False,
     },
     'twostep_t5': {

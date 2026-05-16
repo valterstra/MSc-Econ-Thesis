@@ -3,16 +3,19 @@ set more off
 set linesize 120
 
 * Set working directory to project root
-cd "C:\Users\ValterAdmin\Documents\VS code projects\EconMScThesis"
+cd "C:\Users\valte\Documents\MSc-Econ-Thesis"
 
 * --- Configuration -----------------------------------------------------------
 * Set the zone to estimate. Change to SE1 / SE2 / SE3 / SE4 as needed.
 global ACTIVE_ZONE "SE4"
+* Rolling-window year range.
+global START_YEAR 2015
+global END_YEAR 2025
 * 0 = wind_log only in variance eq. (baseline)
 * 1 = all exogenous controls in variance eq. (extended GARCH-X)
 global HET_ALL_CONTROLS 1
 * Pipeline suffix in the CSV filenames exported by rolling_window_export.py.
-global PIPELINE "log"
+global PIPELINE "log_floor001"
 * Degrees of freedom for Student-t errors.
 * Set to a positive integer >= 3 to fix df (e.g. 5, 6, 8).
 * Set to 0 to estimate df freely from the data.
@@ -45,11 +48,12 @@ global T_DF 5
 *
 * Output:
 *   output from stata/rolling_window_results/joint_t/
-*       rolling_garch_joint_t_{ZONE}_1yr_tdf{T_DF}.csv
+*       rolling_garch_joint_t_{ZONE}_1yr_tdf{T_DF}.csv            when PIPELINE = log
+*       rolling_garch_joint_t_{ZONE}_1yr_{PIPELINE}_tdf{T_DF}.csv otherwise
 *
 * Usage:
 *   1. Run rolling_window_export.py  →  CSVs in stata_input/rolling_windows/
-*   2. Set ACTIVE_ZONE / HET_ALL_CONTROLS / PIPELINE / T_DF above
+*   2. Set ACTIVE_ZONE / START_YEAR / END_YEAR / HET_ALL_CONTROLS / PIPELINE / T_DF above
 *   3. Run this do-file in Stata
 * ============================================================================
 
@@ -67,6 +71,11 @@ else {
 
 capture mkdir "output from stata/rolling_window_results"
 capture mkdir "output from stata/rolling_window_results/joint_t"
+
+local pipeline_suffix ""
+if "$PIPELINE" != "log" {
+    local pipeline_suffix "_$PIPELINE"
+}
 
 * Open long-format postfile
 tempname out_post
@@ -89,11 +98,11 @@ postfile `out_post'             ///
 * ============================================================================
 * Main loop: one zone × 11 windows (1-year, 1-year step, 2015–2025)
 * ============================================================================
-display _n "Zone: $ACTIVE_ZONE  |  Windows: 2015 … 2025  (11 windows)" _n
+display _n "Zone: $ACTIVE_ZONE  |  Windows: $START_YEAR to $END_YEAR" _n
 display    "Joint estimation: arch with `dist_spec'" _n
 
 foreach zone in $ACTIVE_ZONE {
-    forval start_year = 2015/2025 {
+    forval start_year = $START_YEAR/$END_YEAR {
         local end_year = `start_year'
 
         local start = "`start_year'-01-01"
@@ -307,7 +316,7 @@ postclose `out_post'
 quietly {
     use `out_file', clear
     export delimited using ///
-        "output from stata/rolling_window_results/joint_t/rolling_garch_joint_t_${ACTIVE_ZONE}_1yr`df_label'.csv", replace
+        "output from stata/rolling_window_results/joint_t/rolling_garch_joint_t_${ACTIVE_ZONE}_1yr`pipeline_suffix'`df_label'.csv", replace
 }
 
-display _n "Results saved to: output from stata/rolling_window_results/joint_t/rolling_garch_joint_t_${ACTIVE_ZONE}_1yr`df_label'.csv"
+display _n "Results saved to: output from stata/rolling_window_results/joint_t/rolling_garch_joint_t_${ACTIVE_ZONE}_1yr`pipeline_suffix'`df_label'.csv"
